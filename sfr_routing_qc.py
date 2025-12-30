@@ -45,7 +45,6 @@ import pandas as pd
 INT_PAT = re.compile(r'^[+-]?\d+$')
 FLOAT_PAT = re.compile(r'^[+-]?(\d+(\.\d*)?|\.\d+)([Ee][+-]?\d+)?$')
 
-
 def _strip_inline_comments(line: str) -> str:
     # remove common inline comment separators
     for sep in ("#", ";", "!"):
@@ -253,7 +252,7 @@ def write_dot(rt: pd.DataFrame, nss: int, out_dot: str) -> None:
         f.write("}\n")
 
 
-def main():
+'''def main():
     ap = argparse.ArgumentParser(description="SFR segment routing QC: extract segment routing table from SFR input.")
     ap.add_argument("--sfr-input", required=True, help="Path to SFR input file.")
     ap.add_argument("--out-csv", required=True, help="Path to output CSV routing table.")
@@ -276,8 +275,25 @@ def main():
 
     if args.out_dot:
         write_dot(rt, res["nss"], args.out_dot)
-        print(f"Wrote DOT: {args.out_dot}")
+        print(f"Wrote DOT: {args.out_dot}")'''
 
 
+# =========================
+# USER SETTINGS (EDIT ME)
+# =========================
+SFR_INPUT_PATH = r"Y:\mbaillie\Salinas\SVIHM_Historical_20230731\SFR\SFR_SVIHM.txt"
+OUT_CSV_PATH   = r"Y:\mbaillie\SVIHMrouting.csv"
+OUT_DOT_PATH   = r"Y:\mbaillie\SVIHMrouting.dot"  # optional .dot path
+
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
-    main()
+    res = parse_routing_table(SFR_INPUT_PATH)
+    rt = res["routing_table"]
+    rt.to_csv(OUT_CSV_PATH, index=False)
+    print(f"Wrote CSV: {OUT_CSV_PATH}")
+
+    if OUT_DOT_PATH and OUT_DOT_PATH.strip():
+        write_dot(rt, res["nss"], OUT_DOT_PATH)
+        print(f"Wrote DOT: {OUT_DOT_PATH}")
