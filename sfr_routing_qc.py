@@ -37,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import re
 from typing import List, Optional, Tuple
 
@@ -66,7 +67,11 @@ def _is_comment_line(line: str) -> bool:
 
 
 def _tokens(line: str) -> List[str]:
-    return _strip_inline_comments(line).strip().split()
+    """Tokenize a line, handling both whitespace- and comma-separated SFR files."""
+    s = _strip_inline_comments(line)
+    # Many legacy SFR2 files use comma-separated values.
+    s = s.replace(',', ' ')
+    return s.strip().split()
 
 
 def infer_counts_sfr(lines: List[str], max_lines: int = 50000) -> Tuple[int, int, int, str]:
@@ -131,12 +136,15 @@ def _looks_like_segment_header_relaxed(tk: List[str], expected_seg: int) -> bool
     return True
 
 
-def find_segment_block_start(lines: List[str], nss: int) -> int:
+def find_segment_block_start(lines: List[str], nss: int, idx_counts: int, nstrm: int) -> int:
     """
     Locate the first stress period segment block start by finding a segment-1 header
     and confirming a segment-2 header nearby.
     """
-    for i, line in enumerate(lines):
+    # Dataset 2 has one reach line per reach; segment data begins after those reach records.
+    search_start = max(0, idx_counts + 1 + abs(int(nstrm)))
+    for i in range(search_start, len(lines)):
+        line = lines[i]
         if _is_comment_line(line):
             continue
         tk = _tokens(line)
@@ -159,7 +167,7 @@ def parse_routing_table(sfr_input_path: str) -> dict:
         lines = f.readlines()
 
     idx_counts, nstrm, nss, counts_raw = infer_counts_sfr(lines)
-    start = find_segment_block_start(lines, nss)
+    start = find_segment_block_start(lines, nss, idx_counts, nstrm)
 
     rows = []
     expected = 1
@@ -281,19 +289,35 @@ def write_dot(rt: pd.DataFrame, nss: int, out_dot: str) -> None:
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\Salinas\SVIHM_Historical_20230731\SFR\SFR_SVIHM.txt"
-OUT_CSV_PATH   = r"Y:\mbaillie\SVIHMrouting.csv"
-OUT_DOT_PATH   = r"Y:\mbaillie\SVIHMrouting.dot"  # optional .dot path
+SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\CVHMSFR.txt"  # e.g. r"Y:\path\to\model.sfr"
+OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\CVHM_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
+OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\CVHM_RoutingQC.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
+
+# =========================
+# RUN
+# =========================
+
 
 # =========================
 # RUN
 # =========================
 if __name__ == "__main__":
-    res = parse_routing_table(SFR_INPUT_PATH)
-    rt = res["routing_table"]
-    rt.to_csv(OUT_CSV_PATH, index=False)
-    print(f"Wrote CSV: {OUT_CSV_PATH}")
+    # If you pass CLI args, use them (keeps the script usable from a terminal).
+    if len(sys.argv) > 1:
+        main()
+    else:
+        # Spyder/runfile mode: set the USER SETTINGS above.
+        if not SFR_INPUT_PATH or not OUT_CSV_PATH:
+            raise SystemExit(
+                "Set SFR_INPUT_PATH and OUT_CSV_PATH near the bottom of this script, "
+                "or run from the command line with --sfr-input and --out-csv."
+            )
 
-    if OUT_DOT_PATH and OUT_DOT_PATH.strip():
-        write_dot(rt, res["nss"], OUT_DOT_PATH)
-        print(f"Wrote DOT: {OUT_DOT_PATH}")
+        res = parse_routing_table(SFR_INPUT_PATH)
+        rt = res["routing_table"]
+        rt.to_csv(OUT_CSV_PATH, index=False)
+        print(f"Wrote CSV: {OUT_CSV_PATH}")
+
+        if OUT_DOT_PATH and OUT_DOT_PATH.strip():
+            write_dot(rt, res["nss"], OUT_DOT_PATH)
+            print(f"Wrote DOT: {OUT_DOT_PATH}")
