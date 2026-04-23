@@ -7,7 +7,8 @@ indicating whether each segment is a head segment (i.e., no other SFR segment
 flows into this segment), a diversion segment, or a segment that flows out of
 the model (or otherwise does not have an outflow segment defined).
 
-Created by M. Baillie, West Yost, on 30 Dec 2025 with AI assistance.
+Created by M. Baillie, West Yost, on 30 Dec 2025 with AI assistance. Please
+contact mbaillie@westyost.com with questions, issues, and suggestions.
 
 sfr_routing_qc.py
 
