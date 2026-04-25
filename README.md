@@ -10,6 +10,6 @@ If you are here, I likely talked to you about SFR ZoneBudget at the 2026 Califor
 If you have any questions about the tools here, find issues or errors in them, or want to suggest upgrades, please reach out to me at mbaillie@westyost.com or mnbaillie@gmail.com.
 
 References:
-MODFLOW Streamflow-Routing Package v2 (SFR2): Niswonger, R.G. and Prudic, D.E., 2005, Documentation of the Streamflow-Routing (SFR2) Package to include unsaturated flow beneath streams--A modification to SFR1, U.S. Geological Survey Techniques and Methods 6-A13, 47 p.
-MODFLOW Lake Package (LAK): Merritt, M.L. and Konikow, L.F., 2000, Documentation of a Computer Program to Simulate Lake-Aquifer Interaction Using the MODFLOW Ground-Water Flow Model and the MOC3D Solute-Transport Model, U.S. Geological Survey Water-Resources Investigations Report 00-4167, 146 p.
-Graphviz Dot Language: Gansner, E.R. and S.C. North, 1999, An Open Graph Visualization System and Its Applications to Software Engineering, Software-Practice and Experience, 00(S1), p.1-5.
+ - MODFLOW Streamflow-Routing Package v2 (SFR2): Niswonger, R.G. and Prudic, D.E., 2005, Documentation of the Streamflow-Routing (SFR2) Package to include unsaturated flow beneath streams--A modification to SFR1, U.S. Geological Survey Techniques and Methods 6-A13, 47 p.
+ - MODFLOW Lake Package (LAK): Merritt, M.L. and Konikow, L.F., 2000, Documentation of a Computer Program to Simulate Lake-Aquifer Interaction Using the MODFLOW Ground-Water Flow Model and the MOC3D Solute-Transport Model, U.S. Geological Survey Water-Resources Investigations Report 00-4167, 146 p.
+ - Graphviz Dot Language: Gansner, E.R. and S.C. North, 1999, An Open Graph Visualization System and Its Applications to Software Engineering, Software-Practice and Experience, 00(S1), p.1-5.
