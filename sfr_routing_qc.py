@@ -34,6 +34,7 @@ from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 
+
 INT_PAT = re.compile(r'^[+-]?\d+$')
 FLOAT_PAT = re.compile(r'^[+-]?(\d+(\.\d*)?|\.\d+)([Ee][+-]?\d+)?$')
 
@@ -57,12 +58,14 @@ def _is_comment_line(line: str) -> bool:
 
 
 def _tokens(line: str) -> List[str]:
+    """Tokenize a line, handling both whitespace- and comma-separated SFR files."""
     s = _strip_inline_comments(line)
     s = s.replace(",", " ")
     return s.strip().split()
 
 
 def infer_counts_sfr(lines: List[str], max_lines: int = 50000) -> Tuple[int, int, int, str]:
+    """Infer NSTRM and NSS from the SFR input."""
     for i, line in enumerate(lines[:max_lines]):
         if "NSTRM" in line.upper() and not line.strip().startswith(("#", ";", "!", "C", "c", "*")):
             tk = _tokens(line)
@@ -111,9 +114,10 @@ def _looks_like_segment_header_relaxed(tk: List[str], expected_seg: int) -> bool
 def find_segment_block_start(lines: List[str], nss: int, idx_counts: int, nstrm: int) -> int:
     search_start = max(0, idx_counts + 1 + abs(int(nstrm)))
     for i in range(search_start, len(lines)):
-        if _is_comment_line(lines[i]):
+        line = lines[i]
+        if _is_comment_line(line):
             continue
-        tk = _tokens(lines[i])
+        tk = _tokens(line)
         if _looks_like_segment_header_relaxed(tk, 1):
             nonc = 0
             for j in range(i + 1, min(len(lines), i + 5000)):
@@ -199,12 +203,16 @@ def parse_routing_table(sfr_input_path: str) -> dict:
             continue
         tk = _tokens(lines[i])
         if _looks_like_segment_header_relaxed(tk, expected):
+            seg = int(tk[0])
+            icalc = int(tk[1])
+            outseg = int(tk[2])
+            iupseg = int(tk[3])
             rows.append(
                 dict(
-                    segment=int(tk[0]),
-                    icalc=int(tk[1]),
-                    outseg=int(tk[2]),
-                    iupseg=int(tk[3]),
+                    segment=seg,
+                    icalc=icalc,
+                    outseg=outseg,
+                    iupseg=iupseg,
                     header_line_no=i + 1,
                     header_raw=_strip_inline_comments(lines[i]).strip(),
                 )
@@ -219,13 +227,18 @@ def parse_routing_table(sfr_input_path: str) -> dict:
     rt["outseg_norm"] = rt["outseg"].where(rt["outseg"].between(1, nss), 0)
     rt["iupseg_norm"] = rt["iupseg"].where(rt["iupseg"].between(1, nss), 0)
 
-    rt["is_out_of_model"] = ~rt["outseg"].between(1, nss)
+    rt["flows_to_lake"] = rt["outseg"] < 0
+    rt["lake_out_id"] = rt["outseg"].where(rt["outseg"] < 0, 0).abs().astype(int)
+    rt["flows_from_lake"] = rt["iupseg"] < 0
+    rt["lake_in_id"] = rt["iupseg"].where(rt["iupseg"] < 0, 0).abs().astype(int)
+
+    rt["is_out_of_model"] = (~rt["outseg"].between(1, nss)) & (~rt["flows_to_lake"])
     rt["is_diversion_segment"] = rt["iupseg"].between(1, nss)
 
     inflow_targets = set(rt.loc[rt["outseg_norm"] > 0, "outseg_norm"].astype(int)).union(
         set(rt.loc[rt["iupseg_norm"] > 0, "segment"].astype(int))
     )
-    rt["is_head_segment"] = ~rt["segment"].astype(int).isin(inflow_targets)
+    rt["is_head_segment"] = ~rt["segment"].astype(int).isin(inflow_targets) & (~rt["flows_from_lake"])
 
     hanging_segments = identify_hanging_subnetworks(rt)
     rt["is_hanging_subnetwork"] = rt["segment"].astype(int).isin(hanging_segments)
@@ -243,6 +256,7 @@ def parse_routing_table(sfr_input_path: str) -> dict:
         counts_line=counts_raw,
         segblock_start_line_no=start + 1,
         routing_table=rt,
+        lake_ids=sorted(set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].tolist())),
     )
 
 
@@ -288,6 +302,7 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
 
     diversion_segments = set(rt.loc[rt["is_diversion_segment"], "segment"].astype(int))
     hanging_segments = set(rt.loc[rt["is_hanging_subnetwork"], "segment"].astype(int))
+    lake_ids = sorted(set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].astype(int).tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].astype(int).tolist()))
 
     with open(out_dot, "w", encoding="utf-8") as f:
         f.write("digraph SFR_Segments {\n")
@@ -306,15 +321,21 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
         f.write('    style="rounded";\n')
         f.write('    legend_normal [label="Normal segment", shape=box];\n')
         f.write('    legend_div [label="Diversion segment", shape=diamond];\n')
+        f.write('    legend_lake [label="Lake", shape=doubleoctagon];\n')
         f.write('    legend_head [label="Head segment", shape=box, style="rounded"];\n')
         f.write('    legend_out [label="Out of model", shape=box, peripheries=2];\n')
         f.write('    legend_qc [label="Potential QC issue", shape=box, style="filled", fillcolor="#f4cccc", color="#cc0000"];\n')
         f.write('    legend_a [label="", shape=point, width=0.01];\n')
         f.write('    legend_b [label="", shape=point, width=0.01];\n')
         f.write('    legend_c [label="", shape=point, width=0.01];\n')
+        f.write('    legend_d [label="", shape=point, width=0.01];\n')
         f.write('    legend_a -> legend_b [label="Downstream connection"];\n')
         f.write('    legend_b -> legend_c [label="Diversion or diversion-adjacent connection", style=dashed];\n')
+        f.write('    legend_c -> legend_d [label="Lake connection", style=bold];\n')
         f.write("  }\n")
+
+        for lake_id in lake_ids:
+            f.write(f'  "LAKE_{lake_id}" [label="Lake {lake_id}", shape=doubleoctagon];\n')
 
         for r in rt.itertuples(index=False):
             seg = int(r.segment)
@@ -332,10 +353,8 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
                 attrs.append(f'style="{",".join(styles)}"')
             if bool(r.is_out_of_model):
                 attrs.append("peripheries=2")
-
             f.write(f'  "{seg}" [{", ".join(attrs)}];\n')
 
-        # downstream edges: no labels
         for r in rt.itertuples(index=False):
             a = int(r.segment)
             b = int(r.outseg_norm)
@@ -352,7 +371,6 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
             else:
                 f.write(f'  "{a}" -> "{b}";\n')
 
-        # diversion edges
         for r in rt.itertuples(index=False):
             a = int(r.iupseg_norm)
             b = int(r.segment)
@@ -364,6 +382,15 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
                 attrs.append("penwidth=2")
             f.write(f'  "{a}" -> "{b}" [{", ".join(attrs)}];\n')
 
+        for r in rt.itertuples(index=False):
+            seg = int(r.segment)
+            lake_out_id = int(getattr(r, "lake_out_id", 0))
+            lake_in_id = int(getattr(r, "lake_in_id", 0))
+            if lake_out_id > 0:
+                f.write(f'  "{seg}" -> "LAKE_{lake_out_id}" [label="to lake"];\n')
+            if lake_in_id > 0:
+                f.write(f'  "LAKE_{lake_in_id}" -> "{seg}" [label="from lake"];\n')
+
         f.write("}\n")
 
 
@@ -372,7 +399,8 @@ def render_png_from_dot(out_dot: str, out_png: str) -> None:
         import graphviz  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "Python package 'graphviz' is not installed. Install it with 'pip install graphviz' or 'conda install python-graphviz'."
+            "Python package 'graphviz' is not installed. "
+            "Install it with 'pip install graphviz' or 'conda install python-graphviz'."
         ) from exc
 
     os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
@@ -382,7 +410,8 @@ def render_png_from_dot(out_dot: str, out_png: str) -> None:
         src.render(outfile=out_png, format="png", cleanup=False)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to render PNG with Graphviz. Make sure the Graphviz executables (especially 'dot') are installed and available on PATH."
+            "Failed to render PNG with Graphviz. Make sure the Graphviz executables "
+            "(especially 'dot') are installed and available on PATH."
         ) from exc
 
 
@@ -400,10 +429,18 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
     rt.to_csv(args.out_csv, index=False)
+
+    print(f"NSTRM: {res['nstrm']}")
+    print(f"NSS: {res['nss']}")
+    print(f"Counts line: {res['counts_line_no']}: {res['counts_line']}")
+    print(f"Segment block start line: {res['segblock_start_line_no']}")
+    print(f"Out-of-model segments: {int(rt['is_out_of_model'].sum())}")
+    print(f"Diversion segments: {int(rt['is_diversion_segment'].sum())}")
+    print(f"Head segments: {int(rt['is_head_segment'].sum())}")
     print(f"Wrote CSV: {args.out_csv}")
 
     if args.out_dot:
-        write_dot(rt, args.out_dot, NETWORK_DIRECTION)
+        write_dot(rt, args.out_dot)
         print(f"Wrote DOT: {args.out_dot}")
 
     if args.out_png:
@@ -411,7 +448,7 @@ def main() -> None:
         if not dot_for_render:
             root, _ = os.path.splitext(args.out_png)
             dot_for_render = root + ".dot"
-            write_dot(rt, dot_for_render, NETWORK_DIRECTION)
+            write_dot(rt, dot_for_render)
             print(f"Wrote DOT: {dot_for_render}")
         render_png_from_dot(dot_for_render, args.out_png)
         print(f"Wrote PNG: {args.out_png}")
@@ -424,17 +461,17 @@ def main() -> None:
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\yucaipa.sfr"
+SFR_INPUT_PATH = r"Y:\mbaillie\SMWD\Calibrated Model 2023\4b4-hd\4b4-hd\modflow.sfr2"  # e.g. r"Y:\path\to\model.sfr"
 # Provide desired path for QC routing CSV file, leave blank to not print
-OUT_CSV_PATH = r"Y:\mbaillie\SFRZB\yucaipa_RoutingQCv2.csv"
+OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCv2.csv"  # e.g. r"Y:\path\to\routing.csv"
 # Provide desired path for QC routing DOT file, leave blank to not print
-OUT_DOT_PATH = r"Y:\mbaillie\SFRZB\yucaipa_RoutingQCv2.dot"
+OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCv2.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
 # NOTE that you must have the Graphviz system executable installed and available on your PATH to render the PNG.
 # Download at https://www.graphviz.org/download/
 # Otherwise, copy the contents of the .dot file into the input pane of https://dreampuf.github.io/GraphvizOnline/?engine=dot
-OUT_PNG_PATH = r""
+OUT_PNG_PATH   = r""  # optional: r"Y:\path\to\routing.png" (leave blank to skip)
 # Provide desired path for QC log text file, leave blank to not print
-OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\yucaipa_RoutingQCLogv2.txt"
+OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCLogv2.txt"
 # Network diagram direction:
 #   "LR" = left to right
 #   "RL" = right to left
@@ -443,13 +480,17 @@ OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\yucaipa_RoutingQCLogv2.txt"
 NETWORK_DIRECTION = "TB"
 
 
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         main()
     else:
         if not SFR_INPUT_PATH or not OUT_CSV_PATH:
             raise SystemExit(
-                "Set SFR_INPUT_PATH and OUT_CSV_PATH near the bottom of this script, or run from the command line with --sfr-input and --out-csv."
+                "Set SFR_INPUT_PATH and OUT_CSV_PATH near the bottom of this script, "
+                "or run from the command line with --sfr-input and --out-csv."
             )
 
         res = parse_routing_table(SFR_INPUT_PATH)
@@ -463,7 +504,7 @@ if __name__ == "__main__":
         dot_path = OUT_DOT_PATH.strip() if OUT_DOT_PATH else ""
 
         if dot_path:
-            write_dot(rt, dot_path, NETWORK_DIRECTION)
+            write_dot(rt, dot_path)
             dot_written = True
             print(f"Wrote DOT: {dot_path}")
 
@@ -472,8 +513,9 @@ if __name__ == "__main__":
             if not dot_written:
                 root, _ = os.path.splitext(png_path)
                 dot_path = root + ".dot"
-                write_dot(rt, dot_path, NETWORK_DIRECTION)
+                write_dot(rt, dot_path)
                 print(f"Wrote DOT: {dot_path}")
+
             render_png_from_dot(dot_path, png_path)
             print(f"Wrote PNG: {png_path}")
 
