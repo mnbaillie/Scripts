@@ -297,7 +297,13 @@ def write_qc_log(rt: pd.DataFrame, out_log: str) -> None:
             f.write(msg + "\n")
 
 
-def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> None:
+def write_dot(
+    rt: pd.DataFrame,
+    out_dot: str,
+    network_direction: str = "LR",
+    show_legend: bool = True,
+    show_qc_issues: bool = True,
+) -> None:
     os.makedirs(os.path.dirname(out_dot) or ".", exist_ok=True)
 
     diversion_segments = set(rt.loc[rt["is_diversion_segment"], "segment"].astype(int))
@@ -314,25 +320,27 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
         f.write('  edge [fontname="Helvetica"];\n')
 
         # Legend
-        f.write("  subgraph cluster_legend {\n")
-        f.write('    label="Legend";\n')
-        f.write('    fontsize=12;\n')
-        f.write('    color="gray60";\n')
-        f.write('    style="rounded";\n')
-        f.write('    legend_normal [label="Normal segment", shape=box];\n')
-        f.write('    legend_div [label="Diversion segment", shape=diamond];\n')
-        f.write('    legend_lake [label="Lake", shape=doubleoctagon];\n')
-        f.write('    legend_head [label="Head segment", shape=box, style="rounded"];\n')
-        f.write('    legend_out [label="Out of model", shape=box, peripheries=2];\n')
-        f.write('    legend_qc [label="Potential QC issue", shape=box, style="filled", fillcolor="#f4cccc", color="#cc0000"];\n')
-        f.write('    legend_a [label="", shape=point, width=0.01];\n')
-        f.write('    legend_b [label="", shape=point, width=0.01];\n')
-        f.write('    legend_c [label="", shape=point, width=0.01];\n')
-        f.write('    legend_d [label="", shape=point, width=0.01];\n')
-        f.write('    legend_a -> legend_b [label="Downstream connection"];\n')
-        f.write('    legend_b -> legend_c [label="Diversion or diversion-adjacent connection", style=dashed];\n')
-        f.write('    legend_c -> legend_d [label="Lake connection", style=bold];\n')
-        f.write("  }\n")
+        if show_legend:
+            f.write("  subgraph cluster_legend {\n")
+            f.write('    label="Legend";\n')
+            f.write('    fontsize=12;\n')
+            f.write('    color="gray60";\n')
+            f.write('    style="rounded";\n')
+            f.write('    legend_normal [label="Normal segment", shape=box];\n')
+            f.write('    legend_div [label="Diversion segment", shape=diamond];\n')
+            f.write('    legend_lake [label="Lake", shape=doubleoctagon];\n')
+            f.write('    legend_head [label="Head segment", shape=box, style="rounded"];\n')
+            f.write('    legend_out [label="Out of model", shape=box, peripheries=2];\n')
+            if show_qc_issues:
+                f.write('    legend_qc [label="Potential QC issue", shape=box, style="filled", fillcolor="#f4cccc", color="#cc0000"];\n')
+            f.write('    legend_a [label="", shape=point, width=0.01];\n')
+            f.write('    legend_b [label="", shape=point, width=0.01];\n')
+            f.write('    legend_c [label="", shape=point, width=0.01];\n')
+            f.write('    legend_d [label="", shape=point, width=0.01];\n')
+            f.write('    legend_a -> legend_b [label="Downstream connection"];\n')
+            f.write('    legend_b -> legend_c [label="Diversion or diversion-adjacent connection", style=dashed];\n')
+            f.write('    legend_c -> legend_d [label="Lake connection", style=bold];\n')
+            f.write("  }\n")
 
         for lake_id in lake_ids:
             f.write(f'  "LAKE_{lake_id}" [label="Lake {lake_id}", shape=doubleoctagon];\n')
@@ -345,7 +353,7 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
             styles = []
             if bool(r.is_head_segment):
                 styles.append("rounded")
-            if bool(r.is_hanging_subnetwork) or bool(r.has_reverse_downstream_connection) or bool(r.has_reverse_diversion_connection):
+            if show_qc_issues and (bool(r.is_hanging_subnetwork) or bool(r.has_reverse_downstream_connection) or bool(r.has_reverse_diversion_connection)):
                 styles.append("filled")
                 attrs.append('fillcolor="#f4cccc"')
                 attrs.append('color="#cc0000"')
@@ -363,7 +371,7 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
             attrs = []
             if a in diversion_segments or b in diversion_segments:
                 attrs.append("style=dashed")
-            if a > b or (a in hanging_segments and b in hanging_segments):
+            if show_qc_issues and (a > b or (a in hanging_segments and b in hanging_segments)):
                 attrs.append('color="#cc0000"')
                 attrs.append("penwidth=2")
             if attrs:
@@ -377,7 +385,7 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
             if a <= 0:
                 continue
             attrs = ['label="diversion"', "style=dashed"]
-            if a > b or (a in hanging_segments and b in hanging_segments):
+            if show_qc_issues and (a > b or (a in hanging_segments and b in hanging_segments)):
                 attrs.append('color="#cc0000"')
                 attrs.append("penwidth=2")
             f.write(f'  "{a}" -> "{b}" [{", ".join(attrs)}];\n')
@@ -387,9 +395,9 @@ def write_dot(rt: pd.DataFrame, out_dot: str, network_direction: str = "LR") -> 
             lake_out_id = int(getattr(r, "lake_out_id", 0))
             lake_in_id = int(getattr(r, "lake_in_id", 0))
             if lake_out_id > 0:
-                f.write(f'  "{seg}" -> "LAKE_{lake_out_id}" [label="to lake"];\n')
+                f.write(f'  "{seg}" -> "LAKE_{lake_out_id}";\n')
             if lake_in_id > 0:
-                f.write(f'  "LAKE_{lake_in_id}" -> "{seg}" [label="from lake"];\n')
+                f.write(f'  "LAKE_{lake_in_id}" -> "{seg}";\n')
 
         f.write("}\n")
 
@@ -422,6 +430,9 @@ def main() -> None:
     ap.add_argument("--out-dot", default=None, help="Optional Graphviz DOT output path.")
     ap.add_argument("--out-png", default=None, help="Optional rendered PNG output path.")
     ap.add_argument("--out-log", default=None, help="Optional text QC log output path.")
+    ap.add_argument("--network-direction", default="LR", choices=["LR", "RL", "TB", "BT", "lr", "rl", "tb", "bt"], help="Graphviz network direction for DOT/PNG output.")
+    ap.add_argument("--show-legend", action=argparse.BooleanOptionalAction, default=True, help="Show or hide the legend in the DOT/PNG output.")
+    ap.add_argument("--show-qc-issues", action=argparse.BooleanOptionalAction, default=True, help="Highlight or suppress QC issues in the DOT/PNG output.")
     args = ap.parse_args()
 
     res = parse_routing_table(args.sfr_input)
@@ -440,7 +451,7 @@ def main() -> None:
     print(f"Wrote CSV: {args.out_csv}")
 
     if args.out_dot:
-        write_dot(rt, args.out_dot)
+        write_dot(rt, args.out_dot, args.network_direction, args.show_legend, args.show_qc_issues)
         print(f"Wrote DOT: {args.out_dot}")
 
     if args.out_png:
@@ -448,7 +459,7 @@ def main() -> None:
         if not dot_for_render:
             root, _ = os.path.splitext(args.out_png)
             dot_for_render = root + ".dot"
-            write_dot(rt, dot_for_render)
+            write_dot(rt, dot_for_render, args.network_direction, args.show_legend, args.show_qc_issues)
             print(f"Wrote DOT: {dot_for_render}")
         render_png_from_dot(dot_for_render, args.out_png)
         print(f"Wrote PNG: {args.out_png}")
@@ -461,23 +472,27 @@ def main() -> None:
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SMWD\Calibrated Model 2023\4b4-hd\4b4-hd\modflow.sfr2"  # e.g. r"Y:\path\to\model.sfr"
+SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2.sfr"  # e.g. r"Y:\path\to\model.sfr"
 # Provide desired path for QC routing CSV file, leave blank to not print
-OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCv2.csv"  # e.g. r"Y:\path\to\routing.csv"
+OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCv3.csv"  # e.g. r"Y:\path\to\routing.csv"
 # Provide desired path for QC routing DOT file, leave blank to not print
-OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCv2.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
+OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCv3.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
 # NOTE that you must have the Graphviz system executable installed and available on your PATH to render the PNG.
 # Download at https://www.graphviz.org/download/
 # Otherwise, copy the contents of the .dot file into the input pane of https://dreampuf.github.io/GraphvizOnline/?engine=dot
 OUT_PNG_PATH   = r""  # optional: r"Y:\path\to\routing.png" (leave blank to skip)
 # Provide desired path for QC log text file, leave blank to not print
-OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\SMWD_RoutingQCLogv2.txt"
+OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCLogv3.txt"
 # Network diagram direction:
 #   "LR" = left to right
 #   "RL" = right to left
 #   "TB" = top to bottom
 #   "BT" = bottom to top
 NETWORK_DIRECTION = "TB"
+# Show the legend in the DOT/PNG visualization. Set to False for no legend.
+SHOW_LEGEND = True
+# Highlight potential QC issues in the DOT/PNG visualization. Set to False for a clean visualization.
+SHOW_QC_ISSUES = True
 
 
 # =========================
@@ -504,7 +519,7 @@ if __name__ == "__main__":
         dot_path = OUT_DOT_PATH.strip() if OUT_DOT_PATH else ""
 
         if dot_path:
-            write_dot(rt, dot_path)
+            write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES)
             dot_written = True
             print(f"Wrote DOT: {dot_path}")
 
@@ -513,7 +528,7 @@ if __name__ == "__main__":
             if not dot_written:
                 root, _ = os.path.splitext(png_path)
                 dot_path = root + ".dot"
-                write_dot(rt, dot_path)
+                write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES)
                 print(f"Wrote DOT: {dot_path}")
 
             render_png_from_dot(dot_path, png_path)
