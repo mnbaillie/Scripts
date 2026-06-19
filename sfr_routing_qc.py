@@ -260,6 +260,184 @@ def parse_routing_table(sfr_input_path: str) -> dict:
     )
 
 
+def _numeric_lak_records(lines: List[str]) -> List[Tuple[int, List[str], str]]:
+    """Return non-comment LAK records as (1-based line number, tokens, raw text)."""
+    records: List[Tuple[int, List[str], str]] = []
+    for i, line in enumerate(lines):
+        if _is_comment_line(line):
+            continue
+        tk = _tokens(line)
+        if tk:
+            records.append((i + 1, tk, _strip_inline_comments(line).strip()))
+    return records
+
+
+def _first_int_token(tk: List[str]) -> int | None:
+    for token in tk:
+        if INT_PAT.match(token):
+            return int(token)
+    return None
+
+
+def _parse_sublake_records(
+    records: List[Tuple[int, List[str], str]],
+    start_record_index: int,
+    nslms: int,
+    nlakes: int,
+) -> Tuple[List[dict], int]:
+    """Parse NSLMS Data Set 8a records beginning after start_record_index."""
+    systems: List[dict] = []
+    idx = start_record_index + 1
+
+    for system_id in range(1, nslms + 1):
+        while idx < len(records) and not records[idx][1]:
+            idx += 1
+        if idx >= len(records):
+            raise ValueError(
+                f"LAK file ended before sublake system {system_id} of {nslms} could be read."
+            )
+
+        line_no, tk, raw = records[idx]
+        if not tk or not INT_PAT.match(tk[0]):
+            raise ValueError(
+                f"Expected IC for LAK sublake system {system_id} on line {line_no}, but found: {raw}"
+            )
+
+        ic = int(tk[0])
+        if ic <= 0:
+            raise ValueError(
+                f"Expected positive IC for LAK sublake system {system_id} on line {line_no}, but found {ic}."
+            )
+
+        lake_ids: List[int] = []
+        idx2 = idx
+        token_pos = 1
+        while len(lake_ids) < ic:
+            if idx2 >= len(records):
+                raise ValueError(
+                    f"LAK file ended while reading ISUB values for sublake system {system_id}."
+                )
+            line_no2, tk2, raw2 = records[idx2]
+            while token_pos < len(tk2) and len(lake_ids) < ic:
+                if INT_PAT.match(tk2[token_pos]):
+                    lake_id = int(tk2[token_pos])
+                    if lake_id < 1 or lake_id > nlakes:
+                        raise ValueError(
+                            f"Lake ID {lake_id} in sublake system {system_id} is outside the expected range 1..{nlakes}."
+                        )
+                    lake_ids.append(lake_id)
+                token_pos += 1
+            if len(lake_ids) < ic:
+                idx2 += 1
+                token_pos = 0
+
+        systems.append(
+            dict(
+                sublake_system=system_id,
+                ic=ic,
+                lake_ids=lake_ids,
+                line_no=line_no,
+                raw=raw,
+            )
+        )
+        idx = idx2 + 1
+
+    return systems, idx
+
+
+def parse_lak_sublake_systems(lak_input_path: str) -> dict:
+    """
+    Parse key LAK package items used for routing visualization.
+
+    Extracts:
+      - NLAKES from Data Set 1
+      - NSLMS from Data Set 7
+      - IC and ISUB(1)..ISUB(IC) from each Data Set 8a record
+
+    The parser is intentionally focused on these routing/QC items. It ignores the
+    lakebed arrays and time-varying stress-period data that are not needed for the
+    routing diagram. It is tolerant of comments and comma-separated values, but it
+    expects the Data Set 7 / 8a block to be present in standard LAK input order.
+    """
+    with open(lak_input_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    records = _numeric_lak_records(lines)
+    if not records:
+        raise ValueError("LAK input file does not contain any readable numeric records.")
+
+    nlakes_record_index = None
+    nlakes = None
+    for idx, (_line_no, tk, _raw) in enumerate(records):
+        first_int = _first_int_token(tk)
+        if first_int is not None and first_int > 0:
+            nlakes_record_index = idx
+            nlakes = first_int
+            break
+
+    if nlakes_record_index is None or nlakes is None:
+        raise ValueError("Could not identify NLAKES from LAK Data Set 1.")
+
+    explicit_nslms_candidates: List[int] = []
+    for idx, (line_no, tk, raw) in enumerate(records):
+        if idx <= nlakes_record_index:
+            continue
+        if "NSLMS" in raw.upper() or "NSLMS" in lines[line_no - 1].upper():
+            if tk and INT_PAT.match(tk[0]):
+                explicit_nslms_candidates.append(idx)
+
+    valid_candidates: List[Tuple[int, int, List[dict]]] = []
+    candidate_indices = explicit_nslms_candidates or list(range(nlakes_record_index + 1, len(records)))
+
+    for idx in candidate_indices:
+        line_no, tk, raw = records[idx]
+        if not tk or not INT_PAT.match(tk[0]):
+            continue
+        nslms = int(tk[0])
+        if nslms < 0 or nslms > nlakes:
+            continue
+        try:
+            systems, _ = _parse_sublake_records(records, idx, nslms, nlakes)
+        except ValueError:
+            continue
+        valid_candidates.append((idx, nslms, systems))
+
+    if not valid_candidates:
+        raise ValueError(
+            "Could not identify a valid NSLMS / sublake-system block in the LAK input file. "
+            "Check that Data Set 7 and Data Set 8a are present in the expected format."
+        )
+
+    # Prefer explicit NSLMS labels when present. Otherwise use the latest valid
+    # candidate because Data Set 7 occurs after the earlier lake-definition arrays.
+    chosen_idx, nslms, systems = valid_candidates[-1]
+    nslms_line_no, _nslms_tk, nslms_raw = records[chosen_idx]
+    nlakes_line_no, _nlakes_tk, nlakes_raw = records[nlakes_record_index]
+
+    lake_membership: Dict[int, List[int]] = {lake_id: [] for lake_id in range(1, nlakes + 1)}
+    for system in systems:
+        for lake_id in system["lake_ids"]:
+            lake_membership.setdefault(int(lake_id), []).append(int(system["sublake_system"]))
+
+    repeated_lakes = {
+        lake_id: system_ids
+        for lake_id, system_ids in lake_membership.items()
+        if len(system_ids) > 1
+    }
+
+    return dict(
+        nlakes=nlakes,
+        nlakes_line_no=nlakes_line_no,
+        nlakes_line=nlakes_raw,
+        nslms=nslms,
+        nslms_line_no=nslms_line_no,
+        nslms_line=nslms_raw,
+        sublake_systems=systems,
+        lake_membership=lake_membership,
+        repeated_lakes=repeated_lakes,
+    )
+
+
 def write_qc_log(rt: pd.DataFrame, out_log: str) -> None:
     os.makedirs(os.path.dirname(out_log) or ".", exist_ok=True)
     messages: List[str] = []
@@ -303,12 +481,15 @@ def write_dot(
     network_direction: str = "LR",
     show_legend: bool = True,
     show_qc_issues: bool = True,
+    lak_info: dict | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(out_dot) or ".", exist_ok=True)
 
     diversion_segments = set(rt.loc[rt["is_diversion_segment"], "segment"].astype(int))
     hanging_segments = set(rt.loc[rt["is_hanging_subnetwork"], "segment"].astype(int))
-    lake_ids = sorted(set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].astype(int).tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].astype(int).tolist()))
+    lake_ids_from_sfr = set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].astype(int).tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].astype(int).tolist())
+    lake_ids_from_lak = set(range(1, int(lak_info["nlakes"]) + 1)) if lak_info else set()
+    lake_ids = sorted(lake_ids_from_sfr | lake_ids_from_lak)
 
     with open(out_dot, "w", encoding="utf-8") as f:
         f.write("digraph SFR_Segments {\n")
@@ -340,10 +521,34 @@ def write_dot(
             f.write('    legend_a -> legend_b [label="Downstream connection"];\n')
             f.write('    legend_b -> legend_c [label="Diversion or diversion-adjacent connection", style=dashed];\n')
             f.write('    legend_c -> legend_d [label="Lake connection", style=bold];\n')
+            if lak_info:
+                f.write('    legend_sublake_a [label="", shape=point, width=0.01];\n')
+                f.write('    legend_sublake_b [label="", shape=point, width=0.01];\n')
+                f.write('    legend_sublake_a -> legend_sublake_b [label="Sublake-system connection", style=dashed, dir=none];\n')
             f.write("  }\n")
 
         for lake_id in lake_ids:
-            f.write(f'  "LAKE_{lake_id}" [label="Lake {lake_id}", shape=doubleoctagon];\n')
+            label = f"Lake {lake_id}"
+            if lak_info:
+                memberships = lak_info.get("lake_membership", {}).get(int(lake_id), [])
+                if memberships:
+                    label += "\\nSublake systems: " + ", ".join(str(x) for x in memberships)
+            f.write(f'  "LAKE_{lake_id}" [label="{label}", shape=doubleoctagon];\n')
+
+        if lak_info:
+            written_sublake_edges: Set[Tuple[int, int, int]] = set()
+            for system in lak_info.get("sublake_systems", []):
+                system_id = int(system["sublake_system"])
+                ids = [int(x) for x in system.get("lake_ids", [])]
+                for pos, a in enumerate(ids):
+                    for b in ids[pos + 1:]:
+                        edge = (system_id, min(a, b), max(a, b))
+                        if edge in written_sublake_edges:
+                            continue
+                        written_sublake_edges.add(edge)
+                        f.write(
+                            f'  "LAKE_{a}" -> "LAKE_{b}" [label="sublake system {system_id}", style=dashed, dir=none];\n'
+                        )
 
         for r in rt.itertuples(index=False):
             seg = int(r.segment)
@@ -430,6 +635,7 @@ def main() -> None:
     ap.add_argument("--out-dot", default=None, help="Optional Graphviz DOT output path.")
     ap.add_argument("--out-png", default=None, help="Optional rendered PNG output path.")
     ap.add_argument("--out-log", default=None, help="Optional text QC log output path.")
+    ap.add_argument("--lak-input", default=None, help="Optional LAK input file used to add all lakes and sublake-system connections to the DOT/PNG output.")
     ap.add_argument("--network-direction", default="LR", choices=["LR", "RL", "TB", "BT", "lr", "rl", "tb", "bt"], help="Graphviz network direction for DOT/PNG output.")
     ap.add_argument("--show-legend", action=argparse.BooleanOptionalAction, default=True, help="Show or hide the legend in the DOT/PNG output.")
     ap.add_argument("--show-qc-issues", action=argparse.BooleanOptionalAction, default=True, help="Highlight or suppress QC issues in the DOT/PNG output.")
@@ -437,6 +643,7 @@ def main() -> None:
 
     res = parse_routing_table(args.sfr_input)
     rt = res["routing_table"]
+    lak_info = parse_lak_sublake_systems(args.lak_input) if args.lak_input else None
 
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
     rt.to_csv(args.out_csv, index=False)
@@ -448,10 +655,13 @@ def main() -> None:
     print(f"Out-of-model segments: {int(rt['is_out_of_model'].sum())}")
     print(f"Diversion segments: {int(rt['is_diversion_segment'].sum())}")
     print(f"Head segments: {int(rt['is_head_segment'].sum())}")
+    if lak_info:
+        print(f"LAK NLAKES: {lak_info['nlakes']}")
+        print(f"LAK NSLMS: {lak_info['nslms']}")
     print(f"Wrote CSV: {args.out_csv}")
 
     if args.out_dot:
-        write_dot(rt, args.out_dot, args.network_direction, args.show_legend, args.show_qc_issues)
+        write_dot(rt, args.out_dot, args.network_direction, args.show_legend, args.show_qc_issues, lak_info)
         print(f"Wrote DOT: {args.out_dot}")
 
     if args.out_png:
@@ -459,7 +669,7 @@ def main() -> None:
         if not dot_for_render:
             root, _ = os.path.splitext(args.out_png)
             dot_for_render = root + ".dot"
-            write_dot(rt, dot_for_render, args.network_direction, args.show_legend, args.show_qc_issues)
+            write_dot(rt, dot_for_render, args.network_direction, args.show_legend, args.show_qc_issues, lak_info)
             print(f"Wrote DOT: {dot_for_render}")
         render_png_from_dot(dot_for_render, args.out_png)
         print(f"Wrote PNG: {args.out_png}")
@@ -472,17 +682,20 @@ def main() -> None:
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2.sfr"  # e.g. r"Y:\path\to\model.sfr"
+SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4.sfr"  # e.g. r"Y:\path\to\model.sfr"
+# Optional LAK package input file. Provide this to add all lakes and sublake-system connections to the visualization.
+# Leave blank to use only lake connections that can be inferred from negative SFR OUTSEG/IUPSEG values.
+LAK_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4.lak"  # optional: r"Y:\path\to\model.lak"
 # Provide desired path for QC routing CSV file, leave blank to not print
-OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCv3.csv"  # e.g. r"Y:\path\to\routing.csv"
+OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
 # Provide desired path for QC routing DOT file, leave blank to not print
-OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCv3.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
+OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQC.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
 # NOTE that you must have the Graphviz system executable installed and available on your PATH to render the PNG.
 # Download at https://www.graphviz.org/download/
 # Otherwise, copy the contents of the .dot file into the input pane of https://dreampuf.github.io/GraphvizOnline/?engine=dot
 OUT_PNG_PATH   = r""  # optional: r"Y:\path\to\routing.png" (leave blank to skip)
 # Provide desired path for QC log text file, leave blank to not print
-OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\Examples\test2_RoutingQCLogv3.txt"
+OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQCLog.txt"
 # Network diagram direction:
 #   "LR" = left to right
 #   "RL" = right to left
@@ -510,6 +723,11 @@ if __name__ == "__main__":
 
         res = parse_routing_table(SFR_INPUT_PATH)
         rt = res["routing_table"]
+        lak_path = LAK_INPUT_PATH.strip() if LAK_INPUT_PATH else ""
+        lak_info = parse_lak_sublake_systems(lak_path) if lak_path else None
+        if lak_info:
+            print(f"LAK NLAKES: {lak_info['nlakes']}")
+            print(f"LAK NSLMS: {lak_info['nslms']}")
 
         os.makedirs(os.path.dirname(OUT_CSV_PATH) or ".", exist_ok=True)
         rt.to_csv(OUT_CSV_PATH, index=False)
@@ -519,7 +737,7 @@ if __name__ == "__main__":
         dot_path = OUT_DOT_PATH.strip() if OUT_DOT_PATH else ""
 
         if dot_path:
-            write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES)
+            write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info)
             dot_written = True
             print(f"Wrote DOT: {dot_path}")
 
@@ -528,7 +746,7 @@ if __name__ == "__main__":
             if not dot_written:
                 root, _ = os.path.splitext(png_path)
                 dot_path = root + ".dot"
-                write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES)
+                write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info)
                 print(f"Wrote DOT: {dot_path}")
 
             render_png_from_dot(dot_path, png_path)
