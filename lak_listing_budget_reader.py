@@ -5,6 +5,12 @@ lak_listing_budget_reader.py
 Extract MODFLOW LAK package hydrologic budget summaries from a model listing
 file and write a flat CSV with one row per lake per time step.
 
+The LAK hydrologic budget values printed in the MODFLOW listing file are
+volumes over the time step, not rates. This script reads the time-step length
+(DELT) from the listing file metadata and converts the flux-like budget terms
+to rates by dividing by DELT. The output CSV therefore reports these terms in
+model volume per model time, consistent with SFR reach-by-reach flow outputs.
+
 The parser is designed for classic MODFLOW LAK listing-file summaries that
 start with text such as:
 
@@ -18,6 +24,7 @@ It handles observed formatting variants, including:
   * WATER USE, CONNECTED LAKE INFLUX, SURFACE AREA, STAGE CHANGE
   * optional PERCENT DISCREPANCY values
   * N/A (SS) values in steady-state output
+  * automatic conversion of flux-like LAK volume terms to volume-per-time rates
 
 Notes on LAK output:
   * For MODFLOW-2005/NWT-style LAK output, the complete hydrologic lake budget
@@ -44,8 +51,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # =============================================================================
 # USER CONFIGURATION - edit these values if you prefer to run from an IDE
 # =============================================================================
-LISTING_FILE = r"Y:\mbaillie\SFRZB\Test Models\test3\test3.lst"
-OUTPUT_CSV = r"Y:\mbaillie\SFRZB\Test Models\test3\test3_lakbud.csv"
+LISTING_FILE = r"Y:\mbaillie\SFRZB\Test Models\test2\test2.lst"
+OUTPUT_CSV = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_lakbud.csv"
 
 # Text used to identify the start of each instantaneous lake-budget block.
 # The search is case-insensitive and ignores leading/trailing whitespace.
@@ -54,6 +61,14 @@ BLOCK_START_TEXT = "HYDROLOGIC BUDGET SUMMARIES FOR SIMULATED LAKES"
 # By default, skip cumulative lake-budget summaries. This keeps the output at
 # one row per lake per model time step for the present time-step budget.
 INCLUDE_CUMULATIVE_BLOCKS = False
+
+# The lake hydrologic budget terms printed in the MODFLOW listing file are
+# volumes over the time step. When True, divide the flux-like volume terms by
+# DELT so the CSV reports rates in model volume per model time. This should
+# normally remain True for use with the SFR ZoneBudget tool, because SFR output
+# fluxes are rates. Storage/volume terms such as volume_change are left as
+# volumes and are not used by SFR ZoneBudget.
+CONVERT_VOLUME_TERMS_TO_RATES = True
 
 # If True, print a short run summary to the console.
 VERBOSE = True
@@ -83,6 +98,22 @@ SPLIT_LAST_INDEX = 0
 CHECK_STRESS_PERIOD_COVERAGE = True
 
 # =============================================================================
+
+# Flux-like LAK budget terms that are printed as timestep volumes in the
+# listing file and should be converted to volume-per-time rates for use with
+# SFR ZoneBudget. The CSV column names are kept simple; comments/documentation
+# identify that these columns are rates after conversion.
+LAK_VOLUME_TO_RATE_COLUMNS = [
+    "precip",
+    "evap",
+    "runoff",
+    "gw_inflow",
+    "gw_outflow",
+    "sw_inflow",
+    "sw_outflow",
+    "water_use",
+    "connected_lake_influx",
+]
 
 OUTPUT_COLUMNS = [
     "source_file",
@@ -204,6 +235,43 @@ def empty_record(source_file: str, block_type: str, meta: Dict[str, Any], lake: 
     row["block_type"] = block_type
     row["lake"] = lake
     return row
+
+
+def convert_volume_terms_to_rates(rows: List[Dict[str, Any]]) -> None:
+    """Convert LAK listing-file timestep volumes to rates in place.
+
+    MODFLOW LAK hydrologic-budget summaries report precip, evaporation,
+    runoff, groundwater exchange, surface-water exchange, water use, and
+    connected-lake influx as volumes over the time step. SFR reach-by-reach
+    outputs are rates, so the companion CSV used by SFR ZoneBudget should also
+    use rates. This function divides only flux-like LAK terms by DELT and does
+    not alter storage/volume terms such as volume_change or updated_volume.
+    """
+    for row in rows:
+        delt = row.get("delt")
+        try:
+            delt_f = float(delt)
+        except (TypeError, ValueError):
+            has_volume_terms = any(
+                isinstance(row.get(col), (int, float))
+                for col in LAK_VOLUME_TO_RATE_COLUMNS
+            )
+            if has_volume_terms:
+                raise ValueError(
+                    "Cannot convert LAK budget volume terms to rates because DELT "
+                    f"was not parsed for PER={row.get('per')}, STP={row.get('stp')}, "
+                    f"LAKE={row.get('lake')}. Check the listing-file time-step header."
+                )
+            continue
+        if delt_f == 0.0:
+            raise ValueError(
+                "Cannot convert LAK budget volume terms to rates because DELT is zero "
+                f"for PER={row.get('per')}, STP={row.get('stp')}, LAKE={row.get('lake')}."
+            )
+        for col in LAK_VOLUME_TO_RATE_COLUMNS:
+            val = row.get(col)
+            if isinstance(val, (int, float)):
+                row[col] = float(val) / delt_f
 
 
 def get_record(records: Dict[int, Dict[str, Any]], source_file: str, block_type: str, meta: Dict[str, Any], lake: int) -> Dict[str, Any]:
@@ -364,6 +432,7 @@ def parse_listing(
     include_cumulative: bool = INCLUDE_CUMULATIVE_BLOCKS,
     listing_is_split: bool = LISTING_IS_SPLIT,
     split_last_index: int = SPLIT_LAST_INDEX,
+    convert_volume_terms_to_rates_flag: bool = CONVERT_VOLUME_TERMS_TO_RATES,
 ) -> List[Dict[str, Any]]:
     """
     Parse all LAK hydrologic budget summary blocks from one or more
@@ -475,6 +544,9 @@ def parse_listing(
                 "(e.g. MODFLOW-OWHM restart/continuation runs)."
             )
 
+    if convert_volume_terms_to_rates_flag:
+        convert_volume_terms_to_rates(rows)
+
     return rows
 
 
@@ -514,6 +586,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=INCLUDE_CUMULATIVE_BLOCKS,
         help="Also include cumulative lake-budget summaries when present.",
     )
+    parser.add_argument(
+        "--no-rate-conversion",
+        action="store_true",
+        help=(
+            "Do not divide LAK budget volume terms by DELT. By default, the CSV "
+            "reports flux-like terms as rates in model volume per model time."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="Suppress console summary.")
     return parser
 
@@ -526,11 +606,14 @@ def main() -> None:
         args.include_cumulative,
         args.listing_is_split,
         args.split_last_index,
+        not args.no_rate_conversion,
     )
     write_csv(rows, args.output)
     if not args.quiet:
         n_blocks = len({(r.get("block_type"), r.get("per"), r.get("stp"), r.get("totim")) for r in rows})
+        rate_note = "rates (model volume per model time)" if not args.no_rate_conversion else "raw timestep volumes"
         print(f"Wrote {len(rows)} lake-budget row(s) from {n_blocks} parsed block(s) to {args.output}")
+        print(f"Flux-like LAK budget terms are reported as {rate_note}.")
 
 
 if __name__ == "__main__":
