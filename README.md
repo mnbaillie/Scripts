@@ -6,9 +6,12 @@ Welcome to my script repository! This will contain public pre- and post-processi
 Routing visualizations produced by these scripts use the Graphviz DOT language (https://graphviz.org/doc/info/lang.html). If the user does not have the Graphviz executable installed, the .dot file produced by the script can be copied to https://dreampuf.github.io/GraphvizOnline/?engine=dot to generate an image of the routing network.
 
 To ensure you have the all the necessary dependencies, use one of the provided environment files:
+
  conda env create -f environment.yml
  conda activate sfr-zonebudget
+
 or:
+
  pip install -r requirements.txt
 
 If you are here, I likely talked to you about SFR ZoneBudget at the 2026 California Water Environment Modeling Forum (CWEMF) meeting. The poster I presented is included in this repository. I encourage you to test it out on your own models and see how it works for you. I am interested to see new functionalities for the script and how it can be applied to different modeling platforms.
