@@ -1,5 +1,5 @@
 """
-SFR ZoneBudget v0.3
+SFR ZoneBudget v0.4
 
 This script generates a ZoneBudget-style water budget of the surface water
 network of a MODFLOW-OWHMv2 model. It takes as input the SFR input file (to
@@ -7,7 +7,9 @@ generate a network routing diagram), a user-supplied zone file, and the reach-
 by-reach streamflow output file. It generates a spreadsheet with the surface
 water budget for each zone each model timestep, accounting for the following
 components:
-    - FLOW_HEAD: Streamflow entering the zone from outside of the model
+    - FLOW_HEAD: Streamflow entering the zone at headwater segments
+    - ADDITIONAL_INFLOW: Prescribed FLOW entering non-head segments (for example,
+                         FLOW specified on a segment that also receives routed flow)
     - FLOW_SEEPAGE: Groundwater-surface water interaction (positive is loss to
                     groundwater to match groundwater ZoneBudget sign convention)
     - FLOW_OUTOFMODEL: Streamflow leaving the model domain from the zone
@@ -45,6 +47,9 @@ Key features
     * ASCII table (whitespace- or comma-delimited), OR
     * Binary fixed-length record table like USGS "DB" binary (DATE_START + ints + doubles).
       (Zipped binary also supported.)
+    * SFR ISTCB2 positive formatted reach-by-reach listing output.
+    * Experimental full-table binary reach records used by the companion reader.
+      SFR2 negative-ISTCB2 binary cell arrays are detected and rejected with a clear error because they are not full reach-by-reach budgets.
 - Reads a zone configuration file with TWO options:
     * by-segment: Segment, Zone
     * by-reach: Segment, Reach, Zone
@@ -82,8 +87,9 @@ import os
 import re
 import zipfile
 import struct
+from io import StringIO
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -94,17 +100,55 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"path.sfr"          # SFR input file (text)
-SFR_OUTPUT_PATH = r"path\SFRDB.txt"  # ASCII or binary DB output; can be .zip
-ZONE_CONFIG_PATH = r"path.csv"       # by-segment or by-reach
-OUT_EXCEL_PATH = r"path.xlsx"
+SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2.sfr"          # SFR input file (text)
+
+# Optional LAK package input file (text). Leave blank if the model does not use LAK,
+# or if you only want routing inferred from the SFR file. When supplied, the script
+# parses NLAKES and connected sublake systems (NSLMS / IC / ISUB) and writes
+# lake-aware routing QC outputs. This is important when one SFR segment flows into
+# one sublake and another SFR segment receives outflow from a connected sublake.
+LAK_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2.lak"
+
+# Optional LAK budget CSV produced by the companion listing-file scraper. Leave blank
+# if the model does not use LAK, or if you only want SFR-only budgets. Expected
+# columns include per, stp, lake, precip, evap, runoff, gw_inflow, gw_outflow,
+# sw_inflow, sw_outflow, water_use, connected_lake_influx, and volume_change.
+# Lake zones are assigned in the by-segment zone CSV using negative Segment values
+# (for example, Segment=-3 assigns Lake 3 to a zone).
+LAK_BUDGET_CSV_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_lakbud.csv"
+
+SFR_OUTPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_rbr.csv"  # ASCII or binary DB output; can be .zip
+ZONE_CONFIG_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_zone_all1zone.csv"       # by-segment or by-reach
+OUT_EXCEL_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_SFRZB_all1zone.xlsx"
 
 # Optional: choose where to write routing CSV (QC). If blank, writes next to OUT_EXCEL_PATH.
-OUT_ROUTING_CSV_PATH = r"path\RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
+OUT_ROUTING_CSV_PATH = r"Y:\mbaillie\SFRZB\Test Models\test2\test2_all1zone_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
+
+# Optional: choose where to write a lake-aware routing edge list (QC). If blank, writes
+# next to OUT_ROUTING_CSV_PATH using the suffix _edges.csv. This file includes
+# stream-to-stream, stream-to-lake, lake-to-stream, and LAK sublake-system edges.
+OUT_ROUTING_EDGES_CSV_PATH = r""
 
 # If your binary output is zipped and contains multiple files, set this to the member name.
 # If blank, the script will use the first member in the zip.
 ZIP_MEMBER_NAME = r""
+
+# Advanced SFR output reader options. These are used only for binary reach-by-reach
+# records that are neither DB binary nor SFR2 negative-ISTCB2 cell-array output.
+BINARY_RBR_NFLOAT = 11        # 11 if no streambed elevation field, 12 if included
+BINARY_RBR_PRECISION = "auto" # "auto", "double", or "single"
+BINARY_RBR_ENDIAN = "<"       # "<" little-endian, ">" big-endian
+BINARY_RBR_FORTRAN = False    # True if each binary reach row has Fortran record markers
+
+# Diagnostic option only. Keep False for ZoneBudget work. When True, SFR2
+# negative-ISTCB2 cell-array files are returned as gridded cell values instead
+# of raising an error. They are not usable for the reach-by-reach budget.
+ALLOW_SFR2_NEGATIVE_ISTCB2_CELL_ARRAY = False
+
+# Residual-flow tolerance for separating routed inflow from additional prescribed
+# inflow at non-head segments. Values at or below this threshold are treated as
+# numerical noise/roundoff.
+ADDITIONAL_INFLOW_TOLERANCE = 1.0e-9
 
 # Unit conversion and output basis
 # MODFLOW SFR output fluxes are in MODEL_VOLUME / MODEL_TIME.
@@ -123,7 +167,7 @@ ZIP_MEMBER_NAME = r""
 # - Conversion to acre-feet is therefore one-way (cubic length -> acre-feet).
 
 MODEL_LENGTH_UNIT = "ft"          # "ft", "m", or "custom"
-OUTPUT_VOLUME_UNIT = "acft"        # "ft3", "m3", "acft", or "custom"
+OUTPUT_VOLUME_UNIT = "ft3"        # "ft3", "m3", "acft", or "custom"
 
 # If MODEL_LENGTH_UNIT is "custom", provide the number of feet per model length unit.
 # Example: inches -> FT_PER_MODEL_LEN = 1/12
@@ -144,10 +188,10 @@ MODEL_TIME_UNIT_IN_DAYS = 1.0
 # OUTPUT_BASIS controls how fluxes are reported in Excel:
 #   "PER_STRESS_PERIOD" -> integrated volume over each timestep (volume per stress period)
 #   "PER_DAY"           -> average rate over the timestep (volume per day)
-OUTPUT_BASIS = "PER_STRESS_PERIOD"  # or "PER_DAY"
+OUTPUT_BASIS = "PER_DAY"  # or "PER_STRESS_PERIOD"
 
 # Optional label for the output workbook metadata.
-VOLUME_UNIT_LABEL = "ac-ft"  # e.g., "ac-ft", "m^3"
+VOLUME_UNIT_LABEL = "ft^3"  # e.g., "ac-ft", "m^3"
 
 
 # =========================
@@ -348,6 +392,218 @@ def parse_sfr_routing_table(sfr_input_path: str) -> Dict:
     )
 
 
+
+def parse_lak_sublake_systems(lak_input_path: str) -> Dict[str, Any]:
+    """Parse basic LAK package information needed for routing QC.
+
+    This intentionally reads only the parts needed for topology:
+      - NLAKES from Data Set 1
+      - NSLMS from Data Set 7
+      - IC and ISUB(1)..ISUB(IC) from Data Set 8a, repeated NSLMS times
+
+    LAK files vary in how much annotation they include. The parser first looks
+    for lines annotated with NLAKES and NSLMS. If NSLMS is not annotated, the
+    parser returns NLAKES and a warning rather than guessing aggressively.
+    """
+    if not lak_input_path or not str(lak_input_path).strip():
+        return {
+            "lak_input": "",
+            "nlakes": 0,
+            "nslms": 0,
+            "sublake_systems": [],
+            "warnings": ["No LAK input file supplied; connected sublake systems cannot be represented."],
+        }
+
+    with open(lak_input_path, "r", encoding="utf-8", errors="ignore") as f:
+        raw_lines = f.readlines()
+
+    clean = []
+    for idx, line in enumerate(raw_lines):
+        if _is_comment_line(line):
+            continue
+        tk = _tokens(line)
+        if tk:
+            clean.append((idx + 1, line.rstrip("\n"), tk))
+
+    warnings: List[str] = []
+    nlakes = 0
+    nslms = 0
+    systems: List[Dict[str, Any]] = []
+
+    # NLAKES is the first integer on Data Set 1. Prefer annotated line, then
+    # first non-comment integer line as a fallback.
+    nlakes_idx = None
+    for i, (lineno, raw, tk) in enumerate(clean):
+        if "NLAKES" in raw.upper() and INT_PAT.match(tk[0]):
+            nlakes = int(tk[0])
+            nlakes_idx = i
+            break
+    if nlakes_idx is None and clean and INT_PAT.match(clean[0][2][0]):
+        nlakes = int(clean[0][2][0])
+        nlakes_idx = 0
+    if nlakes <= 0:
+        warnings.append("Could not parse a positive NLAKES value from the LAK input file.")
+
+    # NSLMS is Data Set 7. Prefer annotation to avoid confusing it with other
+    # LAK data sets. If absent, do not guess because false positives would be
+    # worse than omitting lake-to-lake QC edges.
+    nslms_idx = None
+    for i, (lineno, raw, tk) in enumerate(clean):
+        if "NSLMS" in raw.upper() and INT_PAT.match(tk[0]):
+            nslms = int(tk[0])
+            nslms_idx = i
+            break
+    if nslms_idx is None:
+        warnings.append("Could not locate an annotated NSLMS line in the LAK file; sublake systems were not parsed.")
+        return {
+            "lak_input": lak_input_path,
+            "nlakes": nlakes,
+            "nslms": 0,
+            "sublake_systems": [],
+            "warnings": warnings,
+        }
+
+    # Data Set 8a: one line/list per sublake system. IC can be followed by the
+    # complete ISUB list on the same line or continued onto following lines.
+    cursor = nslms_idx + 1
+    for sys_no in range(1, nslms + 1):
+        vals: List[int] = []
+        start_line = None
+        while cursor < len(clean):
+            lineno, raw, tk = clean[cursor]
+            cursor += 1
+            ints = []
+            for t in tk:
+                if INT_PAT.match(t):
+                    ints.append(int(t))
+                else:
+                    break
+            if not ints:
+                continue
+            if start_line is None:
+                start_line = lineno
+            vals.extend(ints)
+            if vals:
+                ic = vals[0]
+                if ic <= 0:
+                    warnings.append(f"Sublake system {sys_no} has non-positive IC on line {start_line}; skipped.")
+                    vals = []
+                    break
+                if len(vals) >= ic + 1:
+                    lakes = vals[1:ic + 1]
+                    systems.append({
+                        "system_id": sys_no,
+                        "ic": ic,
+                        "sublakes": lakes,
+                        "line_no": start_line,
+                    })
+                    break
+        if len(systems) < sys_no:
+            warnings.append(f"Could not parse complete IC/ISUB list for sublake system {sys_no}.")
+            break
+
+    return {
+        "lak_input": lak_input_path,
+        "nlakes": nlakes,
+        "nslms": nslms,
+        "sublake_systems": systems,
+        "warnings": warnings,
+    }
+
+
+def build_routing_edges_table(routing: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """Build a node-edge routing table for QC/visualization support.
+
+    Node IDs are strings so lakes and stream segments remain explicit:
+      - SFR segment 12 -> "SFR_12"
+      - Lake 3        -> "LAKE_3"
+    """
+    rows: List[Dict[str, Any]] = []
+    rt = routing.copy()
+    for r in rt.itertuples(index=False):
+        seg = int(r.segment)
+        outseg = int(r.outseg)
+        iupseg = int(r.iupseg)
+        if outseg > 0:
+            rows.append(dict(from_node=f"SFR_{seg}", to_node=f"SFR_{outseg}", from_type="SFR", to_type="SFR", edge_type="SFR_OUTSEG", from_id=seg, to_id=outseg))
+        elif outseg < 0:
+            lake = abs(outseg)
+            rows.append(dict(from_node=f"SFR_{seg}", to_node=f"LAKE_{lake}", from_type="SFR", to_type="LAKE", edge_type="SFR_TO_LAKE_OUTSEG", from_id=seg, to_id=lake))
+        if iupseg < 0:
+            lake = abs(iupseg)
+            rows.append(dict(from_node=f"LAKE_{lake}", to_node=f"SFR_{seg}", from_type="LAKE", to_type="SFR", edge_type="LAKE_TO_SFR_IUPSEG", from_id=lake, to_id=seg))
+
+    if lak_info:
+        for sys in lak_info.get("sublake_systems", []):
+            lakes = [int(x) for x in sys.get("sublakes", [])]
+            if len(lakes) < 2:
+                continue
+            anchor = lakes[0]
+            for lake in lakes[1:]:
+                rows.append(dict(
+                    from_node=f"LAKE_{anchor}",
+                    to_node=f"LAKE_{lake}",
+                    from_type="LAKE",
+                    to_type="LAKE",
+                    edge_type="LAK_SUBLAKE_SYSTEM",
+                    from_id=anchor,
+                    to_id=lake,
+                    sublake_system_id=int(sys.get("system_id", 0)),
+                ))
+
+    if not rows:
+        return pd.DataFrame(columns=["from_node","to_node","from_type","to_type","edge_type","from_id","to_id","sublake_system_id"])
+    edges = pd.DataFrame(rows)
+    if "sublake_system_id" not in edges.columns:
+        edges["sublake_system_id"] = np.nan
+    return edges[["from_node","to_node","from_type","to_type","edge_type","from_id","to_id","sublake_system_id"]]
+
+
+def build_lake_routing_qc(routing: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """Flag potentially incomplete lake routing if LAK sublake systems are absent."""
+    rows: List[Dict[str, Any]] = []
+    rt = routing.copy()
+    stream_to_lake = sorted(set(abs(int(x)) for x in rt.loc[rt["outseg"] < 0, "outseg"].tolist()))
+    lake_to_stream = sorted(set(abs(int(x)) for x in rt.loc[rt["iupseg"] < 0, "iupseg"].tolist()))
+    all_sfr_lakes = sorted(set(stream_to_lake) | set(lake_to_stream))
+
+    systems = (lak_info or {}).get("sublake_systems", []) if lak_info else []
+    lake_to_systems: Dict[int, List[int]] = {}
+    for sys in systems:
+        sid = int(sys.get("system_id", 0))
+        for lake in sys.get("sublakes", []):
+            lake_to_systems.setdefault(int(lake), []).append(sid)
+
+    for lake in all_sfr_lakes:
+        rows.append(dict(
+            qc_type="SFR_LAKE_REFERENCE",
+            lake=lake,
+            related_sublake_systems=",".join(str(x) for x in lake_to_systems.get(lake, [])),
+            message="Lake referenced by SFR OUTSEG/IUPSEG. Connected sublake context is available." if lake in lake_to_systems else "Lake referenced by SFR OUTSEG/IUPSEG. No connected sublake-system context was parsed for this lake.",
+        ))
+
+    if not systems and all_sfr_lakes:
+        rows.append(dict(
+            qc_type="LAK_FILE_RECOMMENDED",
+            lake="",
+            related_sublake_systems="",
+            message="SFR references one or more lakes, but no connected sublake systems were parsed. Supply LAK_INPUT_PATH for models with connected sublakes.",
+        ))
+
+    for sys in systems:
+        lakes = set(int(x) for x in sys.get("sublakes", []))
+        inflow_lakes = sorted(lakes & set(stream_to_lake))
+        outflow_lakes = sorted(lakes & set(lake_to_stream))
+        if inflow_lakes and outflow_lakes and set(inflow_lakes) != set(outflow_lakes):
+            rows.append(dict(
+                qc_type="SUBLAKE_SYSTEM_CROSSES_SFR_CONNECTIONS",
+                lake=";".join(str(x) for x in sorted(lakes)),
+                related_sublake_systems=str(sys.get("system_id", "")),
+                message=f"SFR inflow lake(s) {inflow_lakes} and SFR outflow lake(s) {outflow_lakes} occur within the same connected sublake system; SFR-only routing would not show the full connection.",
+            ))
+
+    return pd.DataFrame(rows, columns=["qc_type","lake","related_sublake_systems","message"])
+
 def read_zone_config(zone_path: str) -> Tuple[str, pd.DataFrame]:
     """
     Read zone configuration.
@@ -393,8 +649,10 @@ def read_zone_config(zone_path: str) -> Tuple[str, pd.DataFrame]:
         z["reach"] = z["reach"].astype(int)
         z["zone"] = z["zone"].astype(int)
 
-        if (z["segment"] <= 0).any() or (z["reach"] <= 0).any():
-            raise ValueError("Zone config contains non-positive Segment/Reach values.")
+        if (z["segment"] == 0).any() or (z["reach"] <= 0).any():
+            raise ValueError("Zone config contains Segment=0 or non-positive Reach values. Use negative Segment values only for lake-zone rows in by-segment files.")
+        if (z["segment"] < 0).any():
+            raise ValueError("Lake-zone rows with negative Segment values are supported only for by-segment zone files, not by-reach files.")
         return "reach", z[required].copy()
 
     else:
@@ -413,9 +671,397 @@ def read_zone_config(zone_path: str) -> Tuple[str, pd.DataFrame]:
         z["segment"] = z["segment"].astype(int)
         z["zone"] = z["zone"].astype(int)
 
-        if (z["segment"] <= 0).any():
-            raise ValueError("Zone config contains non-positive Segment values.")
+
+        if (z["segment"] == 0).any():
+            raise ValueError("Zone config contains Segment=0. Use positive Segment values for SFR segments and negative Segment values for lakes.")
         return "segment", z[required].copy()
+
+
+def read_lake_budget_csv(path: str) -> Optional[pd.DataFrame]:
+    """Read normalized LAK-budget CSV from the companion listing-file scraper.
+
+    The LAK scraper is intentionally kept separate from this ZoneBudget script.
+    This reader only consumes its CSV output and normalizes column names/types so
+    lake budget terms can be included by zone. Leave path blank to disable lake
+    budget handling.
+    """
+    if not path or not str(path).strip():
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"LAK budget CSV was not found: {path}")
+
+    lak = pd.read_csv(path, comment="#")
+    lak.columns = [str(c).strip().lower() for c in lak.columns]
+
+    required = ["per", "stp", "lake"]
+    missing = [c for c in required if c not in lak.columns]
+    if missing:
+        raise ValueError(f"LAK budget CSV is missing required columns: {missing}")
+
+    optional_numeric = [
+        "delt", "pertim", "totim", "stage", "volume", "volume_change", "updated_volume",
+        "precip", "evap", "runoff", "gw_inflow", "gw_outflow", "sw_inflow", "sw_outflow",
+        "water_use", "connected_lake_influx", "surface_area", "percent_discrepancy",
+    ]
+    for c in required + optional_numeric:
+        if c in lak.columns:
+            lak[c] = pd.to_numeric(lak[c], errors="coerce")
+
+    lak = lak.dropna(subset=["per", "stp", "lake"]).copy()
+    if lak.empty:
+        raise ValueError("LAK budget CSV has no valid rows after parsing PER/STP/LAKE.")
+
+    lak["PER"] = lak["per"].astype(int)
+    lak["STP"] = lak["stp"].astype(int)
+    lak["LAKE"] = lak["lake"].astype(int)
+
+    for src, dst in [
+        ("precip", "LAK_PRECIP"),
+        ("evap", "LAK_EVAP"),
+        ("runoff", "LAK_RUNOFF"),
+        ("gw_inflow", "LAK_GW_INFLOW"),
+        ("gw_outflow", "LAK_GW_OUTFLOW"),
+        ("sw_inflow", "LAK_SW_INFLOW_QC"),
+        ("sw_outflow", "LAK_SW_OUTFLOW_QC"),
+        ("water_use", "LAK_WATER_USE"),
+        ("connected_lake_influx", "LAK_CONNECTED_LAKE_INFLUX_QC"),
+        ("volume_change", "LAK_STORAGE_CHANGE"),
+    ]:
+        lak[dst] = lak[src].fillna(0.0).astype(float) if src in lak.columns else 0.0
+
+    keep = [
+        "PER", "STP", "LAKE", "LAK_PRECIP", "LAK_EVAP", "LAK_RUNOFF", "LAK_GW_INFLOW",
+        "LAK_GW_OUTFLOW", "LAK_SW_INFLOW_QC", "LAK_SW_OUTFLOW_QC", "LAK_WATER_USE",
+        "LAK_CONNECTED_LAKE_INFLUX_QC", "LAK_STORAGE_CHANGE",
+    ]
+    return lak[keep]
+
+
+# =========================
+# SFR OUTPUT READER SUPPORT
+# =========================
+LISTING_COLS_11 = [
+    'LAYER','ROW','COL','SEG','RCH',
+    'FLOW_IN','FLOW_SEEPAGE','FLOW_OUT','RUNOFF','PRECIP','STREAM_ET',
+    'HEAD_STREAM','DEPTH_STREAM','WIDTH_STREAM','COND_STREAM','HEAD_GRADIENT'
+]
+LISTING_COLS_12 = LISTING_COLS_11 + ['ELEV_UP_STREAM']
+DB_TAIL_COLS = [
+    'FLOW_IN','FLOW_SEEPAGE','FLOW_OUT','RUNOFF','PRECIP','STREAM_ET',
+    'HEAD_STREAM','HEAD_AQUIFER','DEPTH_STREAM','WIDTH_STREAM','LENGTH_STREAM',
+    'HEAD_GRADIENT','COND_STREAM','ELEV_UP_STREAM'
+]
+REQ = ['PER','STP','SEG','RCH','FLOW_IN','FLOW_SEEPAGE','FLOW_OUT','RUNOFF','PRECIP','STREAM_ET']
+
+_HEADER_RE = re.compile(r"STREAM\s+LISTING\s+PERIOD\s+(\d+)\s+STEP\s+(\d+)", re.I)
+_NUM_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?$")
+
+
+class SfrOutputNotZoneBudgetReady(ValueError):
+    """Raised when a recognized SFR output lacks the full reach-budget fields."""
+
+
+
+def _looks_text(raw: bytes) -> bool:
+    sample = raw[:4096]
+    if not sample:
+        return True
+    nul = sample.count(b'\x00') / max(1, len(sample))
+    if nul > 0.01:
+        return False
+    try:
+        sample.decode('utf-8')
+        return True
+    except UnicodeDecodeError:
+        try:
+            sample.decode('cp1252')
+            return True
+        except Exception:
+            return False
+
+
+def _decode(raw: bytes) -> str:
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw.decode('cp1252', errors='ignore')
+
+
+def read_sfr_reachbyreach_ascii_listing(text: str) -> pd.DataFrame:
+    """Parse formatted SFR ISTCB2 reach-by-reach listing output.
+
+    Handles the 11-float variant (no streambed elevation) and 12-float variant
+    (with ELEVATION). Adds PER/STP from each block header. DELT and SIMTIME are
+    not present in this listing format, so they are left blank/NaN rather than
+    filled with synthetic placeholder values.
+    """
+    rows = []
+    per: Optional[int] = None
+    stp: Optional[int] = None
+    tindex = 0
+    last_key = None
+
+    for line in text.splitlines():
+        m = _HEADER_RE.search(line)
+        if m:
+            per, stp = int(m.group(1)), int(m.group(2))
+            key = (per, stp)
+            if key != last_key:
+                tindex += 1
+                last_key = key
+            continue
+        if per is None:
+            continue
+        toks = line.strip().replace('D','E').replace('d','E').split()
+        if len(toks) not in (16, 17):
+            continue
+        if not all(_NUM_RE.match(t) for t in toks):
+            continue
+        try:
+            ints = [int(float(toks[i])) for i in range(5)]
+        except Exception:
+            continue
+        vals = [float(x) for x in toks[5:]]
+        cols = LISTING_COLS_11 if len(toks) == 16 else LISTING_COLS_12
+        rec = dict(zip(cols[:5], ints))
+        rec.update(dict(zip(cols[5:], vals)))
+        rec.update(PER=per, STP=stp, DELT=np.nan, SIMTIME=np.nan, DATE_START='', DATE_TIME=pd.NaT)
+        rows.append(rec)
+
+    if not rows:
+        raise ValueError('No SFR reach-by-reach listing rows were found.')
+    df = pd.DataFrame(rows)
+    if 'ELEV_UP_STREAM' not in df.columns:
+        df['ELEV_UP_STREAM'] = np.nan
+    if 'HEAD_AQUIFER' not in df.columns:
+        df['HEAD_AQUIFER'] = np.nan
+    if 'LENGTH_STREAM' not in df.columns:
+        df['LENGTH_STREAM'] = np.nan
+    return _normalize(df, source_format='ascii_rbr_listing')
+
+
+def read_db_ascii(text: str) -> pd.DataFrame:
+    df = pd.read_csv(StringIO(text), sep=r'\s+|,', engine='python')
+    if not set(['DATE_START','PER','STP','SEG','RCH']).issubset(df.columns):
+        raise ValueError('Not a DB-style ASCII table')
+    return _normalize(df, source_format='ascii_db')
+
+
+def read_binary_db(raw: bytes) -> pd.DataFrame:
+    """Read OWHM DB binary records: DATE_START, PER/STP/DELT/SIMTIME/SEG/RCH, doubles."""
+    try:
+        s19 = raw[:19].decode('ascii')
+    except Exception:
+        s19 = ''
+    if not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", s19):
+        raise ValueError('Not a DATE_START DB binary file')
+    ts0 = raw[:19]
+    rec_size = raw.find(ts0, 19)
+    if rec_size <= 0:
+        raise ValueError('Could not infer DB binary record size')
+    hdr = struct.Struct('<19s i i d d i i')
+    tail_bytes = rec_size - hdr.size
+    if tail_bytes < 0 or tail_bytes % 8:
+        raise ValueError('Invalid DB binary record size')
+    n_tail = tail_bytes // 8
+    tail_struct = struct.Struct('<' + 'd'*n_tail)
+    nrec = len(raw) // rec_size
+    recs = []
+    for i in range(nrec):
+        chunk = raw[i*rec_size:(i+1)*rec_size]
+        ds, per, stp, delt, simtime, seg, rch = hdr.unpack(chunk[:hdr.size])
+        tail = tail_struct.unpack(chunk[hdr.size:])
+        rec = {'DATE_START': ds.decode('ascii','ignore'), 'PER':per, 'STP':stp, 'DELT':delt, 'SIMTIME':simtime, 'SEG':seg, 'RCH':rch}
+        for c, v in zip(DB_TAIL_COLS, tail):
+            rec[c] = v
+        recs.append(rec)
+    return _normalize(pd.DataFrame(recs), source_format='binary_db')
+
+
+def read_sfr2_istcb2_negative_binary_array(raw: bytes) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """Parse SFR2 ISTCB2<0 MODFLOW-style binary cell array records.
+
+    Observed layout, per record, is the standard single-precision MODFLOW
+    cell-by-cell array header:
+        KSTP, KPER, TEXT(16), NCOL, NROW, NLAY, array(NCOL*NROW*abs(NLAY))
+
+    Returns (metadata, dataframe). The dataframe is cell-based, with LAYER, ROW,
+    COL, and FLOW_OUT for records labelled STREAMFLOW OUT. It does not contain
+    SEG/RCH or the other reach-budget terms needed for ZoneBudget.
+    """
+    off = 0
+    records = []
+    headers = []
+    hdr = struct.Struct('<ii16siii')
+    while off < len(raw):
+        if off + hdr.size > len(raw):
+            raise ValueError('Trailing bytes before a complete MODFLOW array header')
+        kstp, kper, text_b, ncol, nrow, nlay = hdr.unpack(raw[off:off+hdr.size])
+        off += hdr.size
+        text = text_b.decode('ascii', errors='ignore').strip()
+        if ncol <= 0 or nrow <= 0 or nlay == 0 or abs(nlay) > 100000 or ncol > 100000 or nrow > 100000:
+            raise ValueError('Not a plausible MODFLOW binary array header')
+        nvals = ncol * nrow * abs(nlay)
+        nbytes = nvals * 4
+        if off + nbytes > len(raw):
+            raise ValueError('MODFLOW binary array record is incomplete')
+        vals = np.frombuffer(raw, dtype='<f4', count=nvals, offset=off).astype(float)
+        off += nbytes
+        headers.append(dict(KSTP=kstp, KPER=kper, TEXT=text, NCOL=ncol, NROW=nrow, NLAY=nlay, NVALS=nvals))
+        arr = vals.reshape((abs(nlay), nrow, ncol))
+        for ilay in range(abs(nlay)):
+            layer_arr = arr[ilay]
+            rr, cc = np.indices((nrow, ncol))
+            d = pd.DataFrame({
+                'PER': kper,
+                'STP': kstp,
+                'LAYER': ilay + 1,
+                'ROW': rr.ravel() + 1,
+                'COL': cc.ravel() + 1,
+                'BINARY_TEXT': text,
+                'FLOW_OUT': layer_arr.ravel(),
+            })
+            records.append(d)
+    if not records:
+        raise ValueError('No MODFLOW binary array records found')
+    df = pd.concat(records, ignore_index=True)
+    df['DELT'] = 1.0
+    df['SIMTIME'] = df[['PER','STP']].drop_duplicates().reset_index().set_index(['PER','STP'])['index'].add(1).reindex(pd.MultiIndex.from_frame(df[['PER','STP']])).to_numpy(dtype=float)
+    meta = {'source_format':'binary_sfr2_istcb2_cell_array', 'headers': headers, 'zonebudget_ready': False}
+    df.attrs.update(meta)
+    return meta, df
+
+
+def read_binary_rbr_records(raw: bytes, nfloat: int = 11, precision: str = 'auto', endian: str = '<', fortran: bool = False) -> pd.DataFrame:
+    """Read a simple binary equivalent of the formatted listing.
+
+    Expected per-row payload: PER, STP, LAYER, ROW, COL, SEG, RCH as int32,
+    followed by 11 or 12 reals. This is intended as a testable binary pathway.
+    Some compilers wrap unformatted records in 4-byte Fortran record markers;
+    set fortran=True for one row per record.
+    """
+    if precision == 'auto':
+        candidates = ['d','f']
+    elif precision in ('double','float64','d'):
+        candidates = ['d']
+    elif precision in ('single','float32','f'):
+        candidates = ['f']
+    else:
+        raise ValueError('precision must be auto, double, or single')
+    last_err = None
+    for code in candidates:
+        real_size = struct.calcsize(code)
+        payload_size = 7*4 + nfloat*real_size
+        fmt = struct.Struct(endian + '7i' + code*nfloat)
+        recs = []
+        try:
+            if fortran:
+                off = 0
+                while off < len(raw):
+                    if off + 4 > len(raw): raise ValueError('trailing bytes')
+                    reclen = struct.unpack(endian+'i', raw[off:off+4])[0]
+                    off += 4
+                    if reclen != payload_size: raise ValueError(f'record marker {reclen} != {payload_size}')
+                    vals = fmt.unpack(raw[off:off+payload_size]); off += payload_size
+                    endlen = struct.unpack(endian+'i', raw[off:off+4])[0]; off += 4
+                    if endlen != reclen: raise ValueError('mismatched record marker')
+                    recs.append(vals)
+            else:
+                if len(raw) % payload_size:
+                    raise ValueError(f'file size {len(raw)} not multiple of record size {payload_size}')
+                for off in range(0, len(raw), payload_size):
+                    recs.append(fmt.unpack(raw[off:off+payload_size]))
+            rows = []
+            cols = LISTING_COLS_11 if nfloat == 11 else LISTING_COLS_12
+            for vals in recs:
+                per, stp, ilay, row, col, seg, rch = vals[:7]
+                nums = vals[7:]
+                rec = {'PER':per,'STP':stp,'LAYER':ilay,'ROW':row,'COL':col,'SEG':seg,'RCH':rch}
+                rec.update(dict(zip(cols[5:], nums)))
+                rows.append(rec)
+            df = pd.DataFrame(rows)
+            df['DELT'] = 1.0
+            keys = df[['PER','STP']].drop_duplicates().reset_index(drop=True)
+            key_to_i = {(int(p), int(s)): i+1 for i, (p, s) in enumerate(keys.to_numpy().tolist())}
+            df['SIMTIME'] = [float(key_to_i[(p,s)]) for p,s in zip(df.PER, df.STP)]
+            df['DATE_START'] = ''
+            df['DATE_TIME'] = pd.NaT
+            return _normalize(df, source_format=f"binary_rbr_{'fortran_' if fortran else ''}{'double' if code=='d' else 'single'}")
+        except Exception as e:
+            last_err = e
+            continue
+    raise ValueError(f'Could not parse binary RBR records: {last_err}')
+
+
+def _normalize(df: pd.DataFrame, source_format: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    aliases = {
+        'SEG.NO.':'SEG', 'RCH.':'RCH', 'FLOW INTO STRM. RCH.':'FLOW_IN',
+        'FLOW TO AQUIFER':'FLOW_SEEPAGE', 'FLOW OUT OF STRM. RCH.':'FLOW_OUT',
+        'OVRLND. RUNOFF':'RUNOFF', 'DIRECT PRECIP':'PRECIP', 'STREAM ET':'STREAM_ET',
+        'STREAM HEAD':'HEAD_STREAM', 'STREAM DEPTH':'DEPTH_STREAM', 'STREAM WIDTH':'WIDTH_STREAM',
+        'STREAMBED CONDCTNC.':'COND_STREAM', 'STREAMBED GRADIENT':'HEAD_GRADIENT',
+        'STREAMBED ELEVATION':'ELEV_UP_STREAM'
+    }
+    df = df.rename(columns={k:v for k,v in aliases.items() if k in df.columns})
+    for c in ['PER','STP','LAYER','ROW','COL','SEG','RCH']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce').astype('Int64')
+    for c in [x for x in df.columns if x not in ('DATE_START','DATE_TIME') and x not in ['PER','STP','LAYER','ROW','COL','SEG','RCH']]:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    if 'DATE_START' in df.columns and 'DATE_TIME' not in df.columns:
+        df['DATE_TIME'] = pd.to_datetime(df['DATE_START'].astype(str).str.replace('T',' ', regex=False), errors='coerce')
+    for c in ['DELT','SIMTIME']:
+        if c not in df.columns:
+            df[c] = np.nan
+    missing = [c for c in REQ if c not in df.columns]
+    if missing:
+        raise ValueError(f'Missing required normalized columns: {missing}')
+    df.attrs['source_format'] = source_format
+    df.attrs['zonebudget_ready'] = True
+    order = ['DATE_START','DATE_TIME','PER','STP','DELT','SIMTIME','LAYER','ROW','COL','SEG','RCH'] + DB_TAIL_COLS
+    cols = [c for c in order if c in df.columns] + [c for c in df.columns if c not in order]
+    return df[cols]
+
+
+def read_sfr_output_any_bytes(raw: bytes, allow_cell_array: bool = False, **binary_kwargs) -> Tuple[str, pd.DataFrame]:
+    if _looks_text(raw):
+        text = _decode(raw)
+        if 'STREAM LISTING' in text[:100000].upper():
+            df = read_sfr_reachbyreach_ascii_listing(text)
+        else:
+            df = read_db_ascii(text)
+        return df.attrs.get('source_format','ascii'), df
+    try:
+        df = read_binary_db(raw)
+        return df.attrs.get('source_format','binary_db'), df
+    except Exception:
+        pass
+    try:
+        meta, df = read_sfr2_istcb2_negative_binary_array(raw)
+        if allow_cell_array:
+            return meta['source_format'], df
+        texts = ', '.join(sorted(set(df['BINARY_TEXT'].astype(str))))
+        raise SfrOutputNotZoneBudgetReady(
+            "Detected SFR2-style ISTCB2<0 binary cell-array output "
+            f"({texts}). This file is parseable, but it contains gridded model-cell "
+            "values rather than the full reach-by-reach budget table required by "
+            "SFR ZoneBudget. This is common for SFR2 with negative ISTCB2 and "
+            "differs from some older SFR1 behavior. Rerun SFR with a positive "
+            "ISTCB2 value to generate the formatted full reach-by-reach listing. "
+            "DB-style reach output is also acceptable where available."
+        )
+    except SfrOutputNotZoneBudgetReady:
+        raise
+    except Exception:
+        df = read_binary_rbr_records(raw, **binary_kwargs)
+        return df.attrs.get('source_format','binary_rbr'), df
+
+
+def _default_out_csv_path(input_path: str) -> str:
+    base, _ = os.path.splitext(input_path)
+    return base + '_normalized.csv'
 
 
 def _read_binary_member(path: str, member_name: str = "") -> Tuple[str, bytes]:
@@ -434,104 +1080,28 @@ def _read_binary_member(path: str, member_name: str = "") -> Tuple[str, bytes]:
 
 def read_sfr_output(path: str, zip_member: str = "") -> Tuple[str, str, pd.DataFrame]:
     """
-    Returns (format, source_name, dataframe)
-    format: 'binary_db' or 'ascii'
+    Returns (format, source_name, normalized dataframe).
+
+    Supported formats:
+      - OWHM DB-style reach table, ASCII or binary (including zipped members)
+      - SFR ISTCB2 positive formatted reach-by-reach listing, ASCII
+      - Experimental binary reach-by-reach records from the companion reader
+
+    SFR2 negative-ISTCB2 binary cell-array output is auto-detected and rejected
+    because it is not a full reach-by-reach budget table.
     """
     name, raw = _read_binary_member(path, zip_member)
-
-    # Detect binary DB: first 19 bytes look like ASCII date with 'T'
-    head = raw[:64]
-    try:
-        s19 = raw[:19].decode("ascii")
-    except Exception:
-        s19 = ""
-
-    is_date19 = bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", s19))
-    if is_date19:
-        # infer fixed record size by finding the next occurrence of the first timestamp
-        ts0 = raw[:19]
-        rec_size = raw.find(ts0, 19)
-        if rec_size <= 0:
-            raise ValueError("Binary DB detected but could not infer fixed record size.")
-        header_fmt = "<19s i i d d i i"
-        header = struct.Struct(header_fmt)
-        header_size = header.size
-        tail_bytes = rec_size - header_size
-        if tail_bytes % 8 != 0:
-            raise ValueError("Binary DB record tail is not a whole number of doubles.")
-        n_tail = tail_bytes // 8
-        tail_struct = struct.Struct("<" + "d" * n_tail)
-
-        nrec = len(raw) // rec_size
-
-        date_bytes = []
-        per = np.empty(nrec, dtype=np.int32)
-        stp = np.empty(nrec, dtype=np.int32)
-        delt = np.empty(nrec, dtype=np.float64)
-        simtime = np.empty(nrec, dtype=np.float64)
-        seg = np.empty(nrec, dtype=np.int32)
-        rch = np.empty(nrec, dtype=np.int32)
-        tail = np.empty((nrec, n_tail), dtype=np.float64)
-
-        mv = memoryview(raw)
-        off = 0
-        for i in range(nrec):
-            chunk = mv[off:off + rec_size]
-            ds, per[i], stp[i], delt[i], simtime[i], seg[i], rch[i] = header.unpack(chunk[:header_size])
-            date_bytes.append(ds)
-            tail[i, :] = tail_struct.unpack(chunk[header_size:])
-            off += rec_size
-
-        # column names from your ASCII header; extras preserved
-        base_cols = ["DATE_START", "PER", "STP", "DELT", "SIMTIME", "SEG", "RCH"]
-        known_tail = [
-            "FLOW_IN", "FLOW_SEEPAGE", "FLOW_OUT", "RUNOFF", "PRECIP", "STREAM_ET",
-            "HEAD_STREAM", "HEAD_AQUIFER", "DEPTH_STREAM", "WIDTH_STREAM", "LENGTH_STREAM",
-            "HEAD_GRADIENT", "COND_STREAM", "ELEV_UP_STREAM"
-        ]
-        extra_cols = [f"EXTRA_{i+1}" for i in range(max(0, n_tail - len(known_tail)))]
-        tail_cols = known_tail + extra_cols
-
-        df = pd.DataFrame({
-            "DATE_START": [b.decode("ascii", errors="ignore") for b in date_bytes],
-            "PER": per,
-            "STP": stp,
-            "DELT": delt,
-            "SIMTIME": simtime,
-            "SEG": seg,
-            "RCH": rch,
-        })
-        for j, c in enumerate(tail_cols):
-            df[c] = tail[:, j]
-
-        df["DATE_TIME"] = pd.to_datetime(df["DATE_START"].str.replace("T", " ", regex=False), errors="coerce")
-        return "binary_db", name, df
-
-    # Otherwise treat as ASCII text
-    try:
-        text = raw.decode("utf-8")
-    except Exception:
-        text = raw.decode("cp1252", errors="ignore")
-
-    # Try CSV first, fallback to whitespace
-    try:
-        df = pd.read_csv(pd.io.common.StringIO(text), engine="python")
-        fmt = "ascii"
-    except Exception:
-        df = pd.read_table(pd.io.common.StringIO(text), sep=r"\s+", engine="python")
-        fmt = "ascii"
-
-    df.columns = [c.strip() for c in df.columns]
-    # normalize expected columns
-    if "DATE_START" in df.columns and "DATE_TIME" not in df.columns:
-        df["DATE_TIME"] = pd.to_datetime(df["DATE_START"].astype(str).str.replace("T", " ", regex=False), errors="coerce")
-    # enforce ints
-    for c in ("PER", "STP", "SEG", "RCH"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64").astype(int)
-    for c in ("DELT", "SIMTIME"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    binary_kwargs = dict(
+        nfloat=int(BINARY_RBR_NFLOAT),
+        precision=str(BINARY_RBR_PRECISION),
+        endian=str(BINARY_RBR_ENDIAN),
+        fortran=bool(BINARY_RBR_FORTRAN),
+    )
+    fmt, df = read_sfr_output_any_bytes(
+        raw,
+        allow_cell_array=bool(ALLOW_SFR2_NEGATIVE_ISTCB2_CELL_ARRAY),
+        **binary_kwargs,
+    )
     return fmt, name, df
 
 
@@ -542,6 +1112,7 @@ def build_zonebudget_excel(
     zones: pd.DataFrame,
     out_xlsx: str,
     meta: Dict,
+    lake_budget: Optional[pd.DataFrame] = None,
 ) -> None:
     # Build zone mapping
     if zone_mode == "segment":
@@ -555,8 +1126,21 @@ def build_zonebudget_excel(
         seg_zone = None
         reach_zone = lambda s, r: key_to_zone.get((int(s), int(r)), 0)
 
-    # Zones list (include 0)
-    zones_list = sorted(set(df["ZONE"].unique().tolist()) | {0})
+    # Lake zone mapping. Lakes can be assigned in by-segment zone files using
+    # negative Segment values (e.g., Segment=-3 means Lake 3). By-reach zone files
+    # cannot assign lake zones, so lake rows default to Zone 0 if LAK budgets are used.
+    if zone_mode == "segment":
+        lake_to_zone = {abs(int(seg)): int(zone) for seg, zone in zip(zones["segment"], zones["zone"]) if int(seg) < 0}
+    else:
+        lake_to_zone = {}
+
+    if lake_budget is not None:
+        lake_budget = lake_budget.copy()
+        lake_budget["ZONE"] = lake_budget["LAKE"].map(lake_to_zone).fillna(0).astype(int)
+
+    # Zones list (include 0, SFR zones, and any lake-only zones)
+    lake_zones = set(lake_budget["ZONE"].unique().tolist()) if lake_budget is not None else set()
+    zones_list = sorted(set(df["ZONE"].unique().tolist()) | lake_zones | {0})
 
     # Timestep keys
     tkeys = df[["DATE_TIME", "PER", "STP", "DELT", "SIMTIME"]].drop_duplicates().sort_values(["PER", "STP"]).reset_index(drop=True)
@@ -567,6 +1151,7 @@ def build_zonebudget_excel(
     seg_outseg = dict(zip(routing["segment"], routing["outseg_norm"].astype(int)))
     seg_iupseg = dict(zip(routing["segment"], routing["iupseg_norm"].astype(int)))
     seg_is_outmodel = dict(zip(routing["segment"], routing["is_out_of_model"].astype(bool)))
+    seg_is_head = dict(zip(routing["segment"], routing["is_head_segment"].astype(bool)))
 
     # Diversion DEST mapping using IUPSEG: for each destination D with iupseg=S => S->D
     src_to_dests: Dict[int, List[int]] = {}
@@ -694,10 +1279,55 @@ def build_zonebudget_excel(
 
     div_xzone["TYPE"] = "DIVERSION_NET"
 
+    # ---------------- Lake/stream transfers ----------------
+    # SFR-to-lake transfers are explicit in SFR routing as OUTSEG<0; the transfer
+    # amount is the source segment FLOW_OUT. Lake-to-SFR transfers are represented
+    # by destination segments with IUPSEG<0; the amount is estimated from residual
+    # segment inflow after routed upstream inflow and SFR-defined diversion inflow.
+    lake_tr_parts = []
+
+    sfr_to_lake = seg_flow[seg_flow["OUTSEG"] < 0][["PER", "STP", "SEG", "OUTSEG", "SEG_FLOW_OUT", "ZONE"]].copy()
+    if not sfr_to_lake.empty:
+        sfr_to_lake["LAKE"] = sfr_to_lake["OUTSEG"].abs().astype(int)
+        sfr_to_lake["FROM_ZONE"] = sfr_to_lake["ZONE"].astype(int)
+        sfr_to_lake["TO_ZONE"] = sfr_to_lake["LAKE"].map(lake_to_zone).fillna(0).astype(int)
+        sfr_to_lake["Q"] = sfr_to_lake["SEG_FLOW_OUT"].clip(lower=0.0)
+        sfr_to_lake["TYPE"] = "SFR_TO_LAKE"
+        lake_tr_parts.append(sfr_to_lake[["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"]])
+
+    is_lake_inflow_seg = seg_flow["IUPSEG"] < 0
+    seg_flow["LAKE_TO_SFR_IN_SEG"] = 0.0
+    seg_flow.loc[is_lake_inflow_seg, "LAKE_TO_SFR_IN_SEG"] = (
+        seg_flow.loc[is_lake_inflow_seg, "SEG_FLOW_IN"]
+        - seg_flow.loc[is_lake_inflow_seg, "INBOUND_FROM_UPSTREAM"]
+        - seg_flow.loc[is_lake_inflow_seg, "DIV_SFR_TO_DEST"].fillna(0.0)
+    ).clip(lower=0.0)
+
+    lake_to_sfr = seg_flow[is_lake_inflow_seg & (seg_flow["LAKE_TO_SFR_IN_SEG"] > 0)][
+        ["PER", "STP", "SEG", "IUPSEG", "LAKE_TO_SFR_IN_SEG", "ZONE"]
+    ].copy()
+    if not lake_to_sfr.empty:
+        lake_to_sfr["LAKE"] = lake_to_sfr["IUPSEG"].abs().astype(int)
+        lake_to_sfr["FROM_ZONE"] = lake_to_sfr["LAKE"].map(lake_to_zone).fillna(0).astype(int)
+        lake_to_sfr["TO_ZONE"] = lake_to_sfr["ZONE"].astype(int)
+        lake_to_sfr["Q"] = lake_to_sfr["LAKE_TO_SFR_IN_SEG"].clip(lower=0.0)
+        lake_to_sfr["TYPE"] = "LAKE_TO_SFR"
+        lake_tr_parts.append(lake_to_sfr[["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"]])
+
+    if lake_tr_parts:
+        lake_tr = pd.concat(lake_tr_parts, ignore_index=True)
+    else:
+        lake_tr = pd.DataFrame(columns=["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"])
+
+    lake_internal = lake_tr[lake_tr["FROM_ZONE"] == lake_tr["TO_ZONE"]].groupby(["PER", "STP", "FROM_ZONE"], as_index=False)["Q"].sum()
+    lake_internal = lake_internal.rename(columns={"FROM_ZONE": "ZONE", "Q": "LAKE_STREAM_INTERNAL_QC"})
+    lake_xzone = lake_tr[lake_tr["FROM_ZONE"] != lake_tr["TO_ZONE"]].copy()
+
     # Combine transfers (for IN/OUT columns)
     all_tr = pd.concat([
         down_tr[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
-        div_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]]
+        div_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
+        lake_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
     ], ignore_index=True)
     tr_sum = all_tr.groupby(["PER","STP","FROM_ZONE","TO_ZONE"], as_index=False)["Q"].sum()
 
@@ -708,8 +1338,20 @@ def build_zonebudget_excel(
     seg_flow["DIV_NET_IN_SEG"] = seg_flow["DIV_NET_IN_SEG"].fillna(0.0)
 
     # Headwater external flow per segment: inflow - inbound_from_upstream - diverted_in (net indicator)
-    seg_flow["HEAD_EXT"] = seg_flow["SEG_FLOW_IN"] - seg_flow["INBOUND_FROM_UPSTREAM"] - seg_flow["DIV_NET_IN_SEG"]
-    seg_flow["HEAD_EXT"] = seg_flow["HEAD_EXT"].where(seg_flow["HEAD_EXT"] > 1e-9, 0.0)
+    if "LAKE_TO_SFR_IN_SEG" not in seg_flow.columns:
+        seg_flow["LAKE_TO_SFR_IN_SEG"] = 0.0
+    seg_flow["PRESCRIBED_INFLOW_RESIDUAL"] = seg_flow["SEG_FLOW_IN"] - seg_flow["INBOUND_FROM_UPSTREAM"] - seg_flow["DIV_NET_IN_SEG"] - seg_flow["LAKE_TO_SFR_IN_SEG"]
+    seg_flow["PRESCRIBED_INFLOW_RESIDUAL"] = seg_flow["PRESCRIBED_INFLOW_RESIDUAL"].where(
+        seg_flow["PRESCRIBED_INFLOW_RESIDUAL"] > float(ADDITIONAL_INFLOW_TOLERANCE), 0.0
+    )
+    seg_flow["IS_HEAD_SEGMENT"] = seg_flow["SEG"].map(seg_is_head).fillna(False).astype(bool)
+
+    # FLOW_HEAD is prescribed inflow at true headwater segments. If a segment also
+    # receives routed upstream flow, any residual inflow at that segment is reported
+    # separately as ADDITIONAL_INFLOW. This captures non-head FLOW inputs, including
+    # tabfile-driven FLOW values, without trying to read the SFR package/tabfiles.
+    seg_flow["HEAD_EXT"] = np.where(seg_flow["IS_HEAD_SEGMENT"], seg_flow["PRESCRIBED_INFLOW_RESIDUAL"], 0.0)
+    seg_flow["ADDITIONAL_INFLOW"] = np.where(~seg_flow["IS_HEAD_SEGMENT"], seg_flow["PRESCRIBED_INFLOW_RESIDUAL"], 0.0)
 
     # Reach-level terms by zone
     df["RUNOFF_POS"] = df["RUNOFF"].where(df["RUNOFF"] > 0, 0.0)
@@ -724,8 +1366,19 @@ def build_zonebudget_excel(
 
 
     zone_head = seg_flow.groupby(["PER","STP","ZONE"], as_index=False)["HEAD_EXT"].sum().rename(columns={"HEAD_EXT":"FLOW_HEAD"})
+    zone_additional = seg_flow.groupby(["PER","STP","ZONE"], as_index=False)["ADDITIONAL_INFLOW"].sum()
 
     zone_outmodel = seg_flow[seg_flow["IS_OUTMODEL"]].groupby(["PER","STP","ZONE"], as_index=False)["SEG_FLOW_OUT"].sum().rename(columns={"SEG_FLOW_OUT":"FLOW_OUTOFMODEL"})
+
+    lake_cols = [
+        "LAK_PRECIP", "LAK_EVAP", "LAK_RUNOFF", "LAK_GW_INFLOW", "LAK_GW_OUTFLOW",
+        "LAK_WATER_USE", "LAK_STORAGE_CHANGE", "LAK_CONNECTED_LAKE_INFLUX_QC",
+        "LAK_SW_INFLOW_QC", "LAK_SW_OUTFLOW_QC",
+    ]
+    if lake_budget is not None:
+        zone_lake_terms = lake_budget.groupby(["PER", "STP", "ZONE"], as_index=False)[lake_cols].sum()
+    else:
+        zone_lake_terms = pd.DataFrame(columns=["PER", "STP", "ZONE"] + lake_cols)
 
     # helper to build per-zone timeseries
     def zone_ts(z: int) -> pd.DataFrame:
@@ -740,13 +1393,22 @@ def build_zonebudget_excel(
         zh = zone_head[zone_head["ZONE"] == z].drop(columns=["ZONE"])
         ts = ts.merge(zh, on=["PER","STP"], how="left")
 
+        za = zone_additional[zone_additional["ZONE"] == z].drop(columns=["ZONE"])
+        ts = ts.merge(za, on=["PER","STP"], how="left")
+
         zom = zone_outmodel[zone_outmodel["ZONE"] == z].drop(columns=["ZONE"])
         ts = ts.merge(zom, on=["PER","STP"], how="left")
 
         idv = internal_div[internal_div["ZONE"] == z].drop(columns=["ZONE"])
         ts = ts.merge(idv, on=["PER","STP"], how="left")
 
-        for c in ["FLOW_SEEPAGE","RUNOFF","FARM_DIVERSION_NET_QC","PRECIP","STREAM_ET","FLOW_HEAD","FLOW_OUTOFMODEL","DIVERSION_INTERNAL_QC"]:
+        lint = lake_internal[lake_internal["ZONE"] == z].drop(columns=["ZONE"])
+        ts = ts.merge(lint, on=["PER","STP"], how="left")
+
+        lz = zone_lake_terms[zone_lake_terms["ZONE"] == z].drop(columns=["ZONE"])
+        ts = ts.merge(lz, on=["PER","STP"], how="left")
+
+        for c in ["FLOW_SEEPAGE","RUNOFF","FARM_DIVERSION_NET_QC","PRECIP","STREAM_ET","FLOW_HEAD","ADDITIONAL_INFLOW","FLOW_OUTOFMODEL","DIVERSION_INTERNAL_QC","LAKE_STREAM_INTERNAL_QC"] + lake_cols:
             if c not in ts.columns:
                 ts[c] = 0.0
             ts[c] = ts[c].fillna(0.0)
@@ -766,12 +1428,19 @@ def build_zonebudget_excel(
         in_cols = [f"IN_FROM_ZONE_{k}" for k in zones_list]
         out_cols = [f"OUT_TO_ZONE_{k}" for k in zones_list]
         ts["MASS_BALANCE_RESIDUAL"] = (
-            ts["FLOW_HEAD"] + ts["RUNOFF"] + ts["PRECIP"] + ts[in_cols].sum(axis=1)
-            - (ts["FLOW_SEEPAGE"] + ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"] + ts[out_cols].sum(axis=1))
+            ts["FLOW_HEAD"] + ts["ADDITIONAL_INFLOW"] + ts["RUNOFF"] + ts["PRECIP"]
+            + ts["LAK_PRECIP"] + ts["LAK_RUNOFF"] + ts["LAK_GW_INFLOW"]
+            + ts[in_cols].sum(axis=1)
+            - (
+                ts["FLOW_SEEPAGE"] + ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"]
+                + ts["LAK_EVAP"] + ts["LAK_GW_OUTFLOW"] + ts["LAK_WATER_USE"] + ts["LAK_STORAGE_CHANGE"]
+                + ts[out_cols].sum(axis=1)
+            )
         )
 
         core = ["DATE_TIME","PER","STP","DELT","SIMTIME","ZONE",
-                "FLOW_HEAD","FLOW_SEEPAGE","FLOW_OUTOFMODEL","RUNOFF","FARM_DIVERSION_NET_QC","DIVERSION_INTERNAL_QC","PRECIP","STREAM_ET"]
+                "FLOW_HEAD","ADDITIONAL_INFLOW","FLOW_SEEPAGE","FLOW_OUTOFMODEL","RUNOFF","FARM_DIVERSION_NET_QC","DIVERSION_INTERNAL_QC","PRECIP","STREAM_ET",
+                "LAK_PRECIP","LAK_EVAP","LAK_RUNOFF","LAK_GW_INFLOW","LAK_GW_OUTFLOW","LAK_WATER_USE","LAK_STORAGE_CHANGE","LAKE_STREAM_INTERNAL_QC","LAK_CONNECTED_LAKE_INFLUX_QC","LAK_SW_INFLOW_QC","LAK_SW_OUTFLOW_QC"]
         inter = []
         for k in zones_list:
             inter += [f"IN_FROM_ZONE_{k}", f"OUT_TO_ZONE_{k}"]
@@ -799,6 +1468,9 @@ def build_zonebudget_excel(
     sys_head = seg_flow.groupby(["PER","STP"], as_index=False)["HEAD_EXT"].sum().rename(columns={"HEAD_EXT":"FLOW_HEAD"})
     sys_ts = sys_ts.merge(sys_head, on=["PER","STP"], how="left")
 
+    sys_additional = seg_flow.groupby(["PER","STP"], as_index=False)["ADDITIONAL_INFLOW"].sum()
+    sys_ts = sys_ts.merge(sys_additional, on=["PER","STP"], how="left")
+
     # Out-of-model outflow across all segments
     sys_out = seg_flow[seg_flow["IS_OUTMODEL"]].groupby(["PER","STP"], as_index=False)["SEG_FLOW_OUT"].sum().rename(columns={"SEG_FLOW_OUT":"FLOW_OUTOFMODEL"})
     sys_ts = sys_ts.merge(sys_out, on=["PER","STP"], how="left")
@@ -811,20 +1483,31 @@ def build_zonebudget_excel(
     sys_xfer = tr_sum.groupby(["PER","STP"], as_index=False)["Q"].sum().rename(columns={"Q":"INTERZONE_TOTAL_QC"})
     sys_ts = sys_ts.merge(sys_xfer, on=["PER","STP"], how="left")
 
-    for c in ["FLOW_SEEPAGE","RUNOFF","PRECIP","STREAM_ET","FLOW_HEAD","FLOW_OUTOFMODEL","FARM_DIVERSION_NET_TOTAL_QC","INTERZONE_TOTAL_QC"]:
+    if lake_budget is not None:
+        sys_lake = lake_budget.groupby(["PER", "STP"], as_index=False)[lake_cols].sum()
+    else:
+        sys_lake = pd.DataFrame(columns=["PER", "STP"] + lake_cols)
+    sys_ts = sys_ts.merge(sys_lake, on=["PER", "STP"], how="left")
+
+    for c in ["FLOW_SEEPAGE","RUNOFF","PRECIP","STREAM_ET","FLOW_HEAD","ADDITIONAL_INFLOW","FLOW_OUTOFMODEL","FARM_DIVERSION_NET_TOTAL_QC","INTERZONE_TOTAL_QC"] + lake_cols:
         if c not in sys_ts.columns:
             sys_ts[c] = 0.0
         sys_ts[c] = sys_ts[c].fillna(0.0)
 
     # System mass balance residual (no interzone terms; they cancel at system scale)
     sys_ts["MASS_BALANCE_RESIDUAL_SYSTEM"] = (
-        sys_ts["FLOW_HEAD"] + sys_ts["RUNOFF"] + sys_ts["PRECIP"]
-        - (sys_ts["FLOW_SEEPAGE"] + sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"])
+        sys_ts["FLOW_HEAD"] + sys_ts["ADDITIONAL_INFLOW"] + sys_ts["RUNOFF"] + sys_ts["PRECIP"]
+        + sys_ts["LAK_PRECIP"] + sys_ts["LAK_RUNOFF"] + sys_ts["LAK_GW_INFLOW"]
+        - (
+            sys_ts["FLOW_SEEPAGE"] + sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"]
+            + sys_ts["LAK_EVAP"] + sys_ts["LAK_GW_OUTFLOW"] + sys_ts["LAK_WATER_USE"] + sys_ts["LAK_STORAGE_CHANGE"]
+        )
     )
     sys_cols = [
         "DATE_TIME","PER","STP","DELT","SIMTIME","SFR_SYSTEM",
-        "FLOW_HEAD","FLOW_SEEPAGE","FLOW_OUTOFMODEL","RUNOFF",
+        "FLOW_HEAD","ADDITIONAL_INFLOW","FLOW_SEEPAGE","FLOW_OUTOFMODEL","RUNOFF",
         "FARM_DIVERSION_NET_TOTAL_QC","PRECIP","STREAM_ET",
+        "LAK_PRECIP","LAK_EVAP","LAK_RUNOFF","LAK_GW_INFLOW","LAK_GW_OUTFLOW","LAK_WATER_USE","LAK_STORAGE_CHANGE","LAK_CONNECTED_LAKE_INFLUX_QC","LAK_SW_INFLOW_QC","LAK_SW_OUTFLOW_QC",
         "INTERZONE_TOTAL_QC","MASS_BALANCE_RESIDUAL_SYSTEM"
     ]
     sys_ts = sys_ts[sys_cols]
@@ -864,7 +1547,7 @@ def build_zonebudget_excel(
     def _scale_df(df_in: pd.DataFrame, is_system: bool = False) -> pd.DataFrame:
         df = df_in.copy()
         base_cols = [
-            "FLOW_HEAD", "FLOW_SEEPAGE", "FLOW_OUTOFMODEL",
+            "FLOW_HEAD", "ADDITIONAL_INFLOW", "FLOW_SEEPAGE", "FLOW_OUTOFMODEL",
             "RUNOFF", "PRECIP", "STREAM_ET",
         ]
         extra_cols = [
@@ -872,6 +1555,9 @@ def build_zonebudget_excel(
             "DIVERSION_INTERNAL_QC",
             "FARM_DIVERSION_NET_TOTAL_QC",
             "INTERZONE_TOTAL_QC",
+            "LAK_PRECIP", "LAK_EVAP", "LAK_RUNOFF", "LAK_GW_INFLOW", "LAK_GW_OUTFLOW",
+            "LAK_WATER_USE", "LAK_STORAGE_CHANGE", "LAKE_STREAM_INTERNAL_QC",
+            "LAK_CONNECTED_LAKE_INFLUX_QC", "LAK_SW_INFLOW_QC", "LAK_SW_OUTFLOW_QC",
         ]
         flux_cols = [c for c in base_cols + extra_cols if c in df.columns]
         inter_cols = [c for c in df.columns if c.startswith("IN_FROM_ZONE_") or c.startswith("OUT_TO_ZONE_")]
@@ -883,6 +1569,13 @@ def build_zonebudget_excel(
             all_scale_cols.append("MASS_BALANCE_RESIDUAL")
 
         if OUTPUT_BASIS.upper() == "PER_STRESS_PERIOD":
+            if df["DELT"].isna().any():
+                raise ValueError(
+                    "OUTPUT_BASIS='PER_STRESS_PERIOD' requires DELT values, but the selected SFR output "
+                    "does not include DELT for one or more timesteps. This is expected for ISTCB2 formatted "
+                    "reach-by-reach listings. Use OUTPUT_BASIS='PER_DAY' to report rates, or use an output "
+                    "format that includes DELT if integrated volume per stress period is needed."
+                )
             factor = df["DELT"].astype(float) * vol_factor
         elif OUTPUT_BASIS.upper() == "PER_DAY":
             if MODEL_TIME_UNIT_IN_DAYS == 0:
@@ -918,19 +1611,31 @@ def build_zonebudget_excel(
         ("Zone mode", zone_mode),
         ("Default zone for unspecified", 0),
         ("Routing CSV (QC)", meta.get("routing_csv","")),
+        ("Routing edge CSV (QC)", meta.get("routing_edges_csv","")),
+        ("Lake routing QC CSV", meta.get("lake_qc_csv","")),
+        ("LAK input", meta.get("lak_input","")),
+        ("LAK budget CSV", meta.get("lak_budget_csv","")),
+        ("LAK budget row count", meta.get("lak_budget_rows","")),
+        ("LAK NLAKES", meta.get("lak_nlakes","")),
+        ("LAK NSLMS", meta.get("lak_nslms","")),
+        ("LAK parser warnings", meta.get("lak_warnings","")),
+        ("Lake/sublake note", "Negative SFR OUTSEG values are treated as SFR-to-lake edges; negative IUPSEG values are treated as lake-to-SFR edges. LAK sublake systems are written as lake-to-lake QC edges only; internal sublake flows are not quantified."),
+        ("LAK budget handling note", "Optional LAK budget CSV terms are added to zone budgets using lake zones from negative Segment rows in the by-segment zone CSV. SFR-to-lake and lake-to-SFR transfers are mapped from SFR routing and SFR output; LAK SW_INFLOW/SW_OUTFLOW are retained as QC columns to avoid double-counting stream-lake transfers."),
         ("NSTRM", meta.get("nstrm","")),
         ("NSS", meta.get("nss","")),
         ("Timestep count", len(tkeys)),
         ("Zones present (including 0)", ", ".join(str(z) for z in zones_list)),
         ("Diversion method", "SFR-defined diversions stay in the stream system (accounted via IUPSEG). FMP semi-routed diversions (negative RUNOFF) leave the stream system and are treated as FARM_DIVERSION_NET."),
         ("Diversion caveat", "RUNOFF at diversion sources may include natural runoff (+) and diversion (-); FARM_DIVERSION_NET=max(0,-RUNOFF) is a net indicator, not guaranteed gross diversion."),
+        ("Additional inflow method", "For non-head segments, ADDITIONAL_INFLOW=max(0, segment FLOW_IN - routed upstream inflow - SFR diversion inflow). This captures prescribed FLOW at non-head locations, including tabfile-driven FLOW, without reading tabfiles."),
+        ("Additional inflow tolerance", ADDITIONAL_INFLOW_TOLERANCE),
         ("Output basis", OUTPUT_BASIS),
         ("Model length unit", MODEL_LENGTH_UNIT),
         ("Output volume unit", OUTPUT_VOLUME_UNIT),
         ("Custom volume factor", VOLUME_CONV_FACTOR if OUTPUT_VOLUME_UNIT.lower()=="custom" else ""),
                 ("Model time unit in days", MODEL_TIME_UNIT_IN_DAYS),
         ("Volume units label", VOLUME_UNIT_LABEL),
-        ("Notes", "DATE_START parsed to DATE_TIME after replacing 'T' with space. All reported flux terms are scaled to either integrated volume per stress period or average rate in volume-per-day, depending on OUTPUT_BASIS. MASS_BALANCE_RESIDUAL is in the same units."),
+        ("Notes", "DATE_START parsed to DATE_TIME after replacing 'T' with space. All reported flux terms are scaled to either integrated volume per stress period or average rate in volume-per-day, depending on OUTPUT_BASIS. For ISTCB2 formatted listings, DELT and SIMTIME are not present in the SFR output and are left blank. MASS_BALANCE_RESIDUAL is in the same units."),
     ]
 
     ws.append(["Field", "Value"])
@@ -995,13 +1700,28 @@ def run():
     # Parse routing and write QC CSV
     routing_res = parse_sfr_routing_table(SFR_INPUT_PATH)
     routing = routing_res["routing_table"].copy()
+
+    lak_info = parse_lak_sublake_systems(LAK_INPUT_PATH)
+    routing_edges_csv = OUT_ROUTING_EDGES_CSV_PATH.strip()
+    if not routing_edges_csv:
+        base, _ = os.path.splitext(routing_csv)
+        routing_edges_csv = base + "_edges.csv"
+    lake_qc_csv = os.path.splitext(routing_edges_csv)[0] + "_lake_qc.csv"
+
     routing.to_csv(routing_csv, index=False)
+    routing_edges = build_routing_edges_table(routing, lak_info)
+    routing_edges.to_csv(routing_edges_csv, index=False)
+    lake_qc = build_lake_routing_qc(routing, lak_info)
+    lake_qc.to_csv(lake_qc_csv, index=False)
 
     # Read zones
     zone_mode, zones = read_zone_config(ZONE_CONFIG_PATH)
 
     # Read SFR output
     fmt, member, df = read_sfr_output(SFR_OUTPUT_PATH, ZIP_MEMBER_NAME)
+
+    # Read optional LAK budget CSV produced by the companion listing-file scraper
+    lake_budget = read_lake_budget_csv(LAK_BUDGET_CSV_PATH)
 
     # Validate required columns
     needed = ["DATE_TIME","PER","STP","DELT","SIMTIME","SEG","RCH","FLOW_IN","FLOW_OUT","RUNOFF","PRECIP","STREAM_ET","FLOW_SEEPAGE"]
@@ -1016,15 +1736,27 @@ def run():
         sfr_output_format=fmt,
         zone_config=ZONE_CONFIG_PATH,
         routing_csv=routing_csv,
+        routing_edges_csv=routing_edges_csv,
+        lake_qc_csv=lake_qc_csv,
+        lak_input=LAK_INPUT_PATH,
+        lak_budget_csv=LAK_BUDGET_CSV_PATH,
+        lak_budget_rows=0 if lake_budget is None else len(lake_budget),
+        lak_nlakes=lak_info.get("nlakes", ""),
+        lak_nslms=lak_info.get("nslms", ""),
+        lak_warnings=" | ".join(lak_info.get("warnings", [])),
         nstrm=routing_res["nstrm"],
         nss=routing_res["nss"],
     )
 
-    build_zonebudget_excel(df, routing, zone_mode, zones, OUT_EXCEL_PATH, meta)
+    build_zonebudget_excel(df, routing, zone_mode, zones, OUT_EXCEL_PATH, meta, lake_budget=lake_budget)
 
     print("=== SFR ZoneBudget ===")
-    print(f"Wrote routing CSV: {routing_csv}")
-    print(f"Wrote Excel:       {OUT_EXCEL_PATH}")
+    print(f"Wrote routing CSV:      {routing_csv}")
+    print(f"Wrote routing edge CSV: {routing_edges_csv}")
+    print(f"Wrote lake QC CSV:      {lake_qc_csv}")
+    if lake_budget is not None:
+        print(f"Read LAK budget rows:   {len(lake_budget)}")
+    print(f"Wrote Excel:            {OUT_EXCEL_PATH}")
 
 
 if __name__ == "__main__":
