@@ -132,22 +132,49 @@ def find_segment_block_start(lines: List[str], nss: int, idx_counts: int, nstrm:
     raise ValueError("Could not locate the start of the segment data block (stress period 1).")
 
 
-def _build_undirected_adjacency(rt: pd.DataFrame) -> Dict[int, Set[int]]:
-    adj: Dict[int, Set[int]] = {int(seg): set() for seg in rt["segment"].tolist()}
+def _build_undirected_adjacency(rt: pd.DataFrame, lak_info: dict | None = None) -> Dict[str, Set[str]]:
+    """Build an undirected topology graph for hanging-subnetwork QC.
+
+    Include virtual LAKE_n nodes so streams that drain to or receive flow from
+    lakes are not falsely identified as disconnected SFR-only subnetworks. When
+    LAK sublake-system information is available, connect lakes in the same
+    sublake system as well.
+    """
+    adj: Dict[str, Set[str]] = {f"SFR_{int(seg)}": set() for seg in rt["segment"].tolist()}
+
+    def add_edge(a: str, b: str) -> None:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
     for r in rt.itertuples(index=False):
-        a = int(r.segment)
-        b = int(r.outseg_norm)
-        c = int(r.iupseg_norm)
-        if b > 0:
-            adj[a].add(b)
-            adj[b].add(a)
-        if c > 0:
-            adj[a].add(c)
-            adj[c].add(a)
+        a = f"SFR_{int(r.segment)}"
+        outseg = int(r.outseg)
+        iupseg = int(r.iupseg)
+        if outseg > 0:
+            add_edge(a, f"SFR_{outseg}")
+        elif outseg < 0:
+            add_edge(a, f"LAKE_{abs(outseg)}")
+        if iupseg > 0:
+            add_edge(a, f"SFR_{iupseg}")
+        elif iupseg < 0:
+            add_edge(a, f"LAKE_{abs(iupseg)}")
+
+    if lak_info:
+        for lake_id in range(1, int(lak_info.get("nlakes", 0) or 0) + 1):
+            adj.setdefault(f"LAKE_{lake_id}", set())
+        for system in lak_info.get("sublake_systems", []):
+            lakes = system.get("lake_ids", system.get("sublakes", []))
+            lakes = [int(x) for x in lakes]
+            if len(lakes) < 2:
+                continue
+            anchor = f"LAKE_{lakes[0]}"
+            for lake in lakes[1:]:
+                add_edge(anchor, f"LAKE_{lake}")
+
     return adj
 
 
-def _connected_components(adj: Dict[int, Set[int]]) -> List[Set[int]]:
+def _connected_components(adj: Dict[str, Set[str]]) -> List[Set[str]]:
     seen: Set[int] = set()
     comps: List[Set[int]] = []
     for start in adj:
@@ -167,11 +194,11 @@ def _connected_components(adj: Dict[int, Set[int]]) -> List[Set[int]]:
     return comps
 
 
-def identify_hanging_subnetworks(rt: pd.DataFrame) -> Set[int]:
+def identify_hanging_subnetworks(rt: pd.DataFrame, lak_info: dict | None = None) -> Set[int]:
     n_total = len(rt)
     if n_total <= 2:
         return set()
-    adj = _build_undirected_adjacency(rt)
+    adj = _build_undirected_adjacency(rt, lak_info=lak_info)
     comps = _connected_components(adj)
     if len(comps) <= 1:
         return set()
@@ -183,7 +210,11 @@ def identify_hanging_subnetworks(rt: pd.DataFrame) -> Set[int]:
         if size == largest:
             continue
         if size == 1 or size == 2 or size < 0.10 * n_total:
-            flagged.update(comp)
+            for node in comp:
+                if str(node).startswith("SFR_"):
+                    tail = str(node).replace("SFR_", "", 1)
+                    if tail.isdigit():
+                        flagged.add(int(tail))
     return flagged
 
 
@@ -258,6 +289,14 @@ def parse_routing_table(sfr_input_path: str) -> dict:
         routing_table=rt,
         lake_ids=sorted(set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].tolist())),
     )
+
+
+def update_hanging_subnetwork_flags(rt: pd.DataFrame, lak_info: dict | None = None) -> pd.DataFrame:
+    """Recompute hanging-subnetwork flags with optional LAK connectivity."""
+    rt = rt.copy()
+    hanging_segments = identify_hanging_subnetworks(rt, lak_info=lak_info)
+    rt["is_hanging_subnetwork"] = rt["segment"].astype(int).isin(hanging_segments)
+    return rt
 
 
 def _numeric_lak_records(lines: List[str]) -> List[Tuple[int, List[str], str]]:
@@ -438,6 +477,170 @@ def parse_lak_sublake_systems(lak_input_path: str) -> dict:
     )
 
 
+
+def _normalize_zone_header(name: str) -> str:
+    """Normalize common zone-file column names."""
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
+
+def _read_zone_input_table(zone_input_path: str) -> pd.DataFrame:
+    """
+    Read a simple ZoneBudget-style zone input table.
+
+    Supported forms include:
+      - headered CSV/whitespace table with columns such as SEGMENT, ZONE
+        (negative SEGMENT values are interpreted as lakes; e.g., -1 = Lake 1)
+      - headered table with TYPE, ID, ZONE where TYPE is SEGMENT/SEG/LAKE/LAK
+      - headerless two-column table interpreted as SEGMENT, ZONE
+        (negative SEGMENT values are interpreted as lakes; e.g., -1 = Lake 1)
+      - headerless three-column table interpreted as TYPE, ID, ZONE
+
+    Lines beginning with #, ;, !, C/c, or * are ignored. Inline comments are
+    stripped using the same convention as the SFR/LAK parsers.
+    """
+    rows: List[List[str]] = []
+    with open(zone_input_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if _is_comment_line(line):
+                continue
+            tk = _tokens(line)
+            if tk:
+                rows.append(tk)
+
+    if not rows:
+        raise ValueError("Zone input file does not contain any readable records.")
+
+    first = rows[0]
+    has_header = any(not (INT_PAT.match(x) or FLOAT_PAT.match(x)) for x in first)
+    if has_header:
+        max_cols = max(len(r) for r in rows)
+        header = [_normalize_zone_header(x) for x in first]
+        data = [r + [""] * (max_cols - len(r)) for r in rows[1:]]
+        header = header + [f"extra{i}" for i in range(len(header), max_cols)]
+        df = pd.DataFrame(data, columns=header[:max_cols])
+    else:
+        max_cols = max(len(r) for r in rows)
+        data = [r + [""] * (max_cols - len(r)) for r in rows]
+        if max_cols == 2:
+            df = pd.DataFrame(data, columns=["segment", "zone"])
+        elif max_cols >= 3:
+            df = pd.DataFrame(data, columns=["type", "id", "zone"] + [f"extra{i}" for i in range(3, max_cols)])
+        else:
+            raise ValueError("Zone input file must have at least two columns.")
+
+    return df
+
+
+def _as_int(value: object) -> int | None:
+    s = str(value).strip()
+    if INT_PAT.match(s):
+        return int(s)
+    if FLOAT_PAT.match(s):
+        v = float(s)
+        if v.is_integer():
+            return int(v)
+    return None
+
+
+def parse_zone_input(zone_input_path: str) -> dict:
+    """
+    Parse an optional ZoneBudget zone input file for routing visualization.
+
+    Returns node-to-zone assignments using graph node IDs:
+      - SFR segments: "1", "2", ...
+      - lakes: "LAKE_1", "LAKE_2", ...
+
+    Zone 0 records are retained in the assignment table but are intentionally
+    omitted from the Graphviz zone subgraphs.
+    """
+    df = _read_zone_input_table(zone_input_path)
+    cols = set(df.columns)
+
+    zone_col = next((c for c in df.columns if c in {"zone", "zoneid", "zonebudgetzone", "zbzone"}), None)
+    if zone_col is None:
+        raise ValueError("Could not identify a ZONE column in the zone input file.")
+
+    type_col = next((c for c in df.columns if c in {"type", "nodetype", "featuretype", "kind"}), None)
+    id_col = next((c for c in df.columns if c in {"id", "node", "nodeid", "featureid"}), None)
+    segment_col = next((c for c in df.columns if c in {"segment", "seg", "nseg", "iseg"}), None)
+    lake_col = next((c for c in df.columns if c in {"lake", "lak", "lakeid", "ilake"}), None)
+
+    assignments: Dict[str, int] = {}
+    records: List[dict] = []
+
+    for row_index, row in df.iterrows():
+        zone = _as_int(row.get(zone_col, ""))
+        if zone is None:
+            continue
+
+        node_id = None
+        feature_type = None
+        feature_id = None
+
+        if type_col and id_col:
+            raw_type = str(row.get(type_col, "")).strip().lower()
+            feature_id = _as_int(row.get(id_col, ""))
+            if feature_id is None:
+                continue
+            if raw_type in {"lake", "lak", "l", "la"}:
+                feature_type = "lake"
+                node_id = f"LAKE_{feature_id}"
+            elif raw_type in {"segment", "seg", "sfr", "stream", "streamsegment"}:
+                feature_type = "segment"
+                node_id = str(feature_id)
+            else:
+                # Unknown type; skip instead of guessing incorrectly.
+                continue
+        elif segment_col:
+            feature_id = _as_int(row.get(segment_col, ""))
+            if feature_id is None:
+                continue
+            # ZoneBudget zone files commonly use negative identifiers for lakes,
+            # following the same convention as negative SFR OUTSEG/IUPSEG values.
+            # For example, SEGMENT=-1 means Lake 1.
+            if feature_id < 0:
+                feature_type = "lake"
+                feature_id = abs(feature_id)
+                node_id = f"LAKE_{feature_id}"
+            else:
+                feature_type = "segment"
+                node_id = str(feature_id)
+        elif lake_col:
+            feature_id = _as_int(row.get(lake_col, ""))
+            if feature_id is None:
+                continue
+            feature_type = "lake"
+            node_id = f"LAKE_{feature_id}"
+        else:
+            raise ValueError(
+                "Could not identify segment/lake identifiers in the zone input file. "
+                "Use columns such as SEGMENT,ZONE or TYPE,ID,ZONE."
+            )
+
+        assignments[node_id] = int(zone)
+        records.append(
+            dict(
+                node_id=node_id,
+                feature_type=feature_type,
+                feature_id=feature_id,
+                zone=int(zone),
+                source_row=int(row_index) + 1,
+            )
+        )
+
+    zone_to_nodes: Dict[int, List[str]] = {}
+    for node_id, zone in assignments.items():
+        zone_to_nodes.setdefault(int(zone), []).append(node_id)
+    for zone in zone_to_nodes:
+        zone_to_nodes[zone] = sorted(zone_to_nodes[zone], key=lambda x: (x.startswith("LAKE_"), int(x.replace("LAKE_", "")) if x.replace("LAKE_", "").isdigit() else x))
+
+    return dict(
+        assignments=assignments,
+        zone_to_nodes=zone_to_nodes,
+        records=records,
+        dataframe=pd.DataFrame(records),
+    )
+
 def write_qc_log(rt: pd.DataFrame, out_log: str) -> None:
     os.makedirs(os.path.dirname(out_log) or ".", exist_ok=True)
     messages: List[str] = []
@@ -482,6 +685,7 @@ def write_dot(
     show_legend: bool = True,
     show_qc_issues: bool = True,
     lak_info: dict | None = None,
+    zone_info: dict | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(out_dot) or ".", exist_ok=True)
 
@@ -489,7 +693,14 @@ def write_dot(
     hanging_segments = set(rt.loc[rt["is_hanging_subnetwork"], "segment"].astype(int))
     lake_ids_from_sfr = set(rt.loc[rt["lake_out_id"] > 0, "lake_out_id"].astype(int).tolist()) | set(rt.loc[rt["lake_in_id"] > 0, "lake_in_id"].astype(int).tolist())
     lake_ids_from_lak = set(range(1, int(lak_info["nlakes"]) + 1)) if lak_info else set()
-    lake_ids = sorted(lake_ids_from_sfr | lake_ids_from_lak)
+    lake_ids_from_zones = set()
+    if zone_info:
+        for node_id in zone_info.get("assignments", {}):
+            if str(node_id).startswith("LAKE_"):
+                lake_id = _as_int(str(node_id).replace("LAKE_", ""))
+                if lake_id is not None and lake_id > 0:
+                    lake_ids_from_zones.add(lake_id)
+    lake_ids = sorted(lake_ids_from_sfr | lake_ids_from_lak | lake_ids_from_zones)
 
     with open(out_dot, "w", encoding="utf-8") as f:
         f.write("digraph SFR_Segments {\n")
@@ -568,6 +779,20 @@ def write_dot(
                 attrs.append("peripheries=2")
             f.write(f'  "{seg}" [{", ".join(attrs)}];\n')
 
+        if zone_info:
+            valid_nodes = set(str(x) for x in rt["segment"].astype(int).tolist()) | {f"LAKE_{lake_id}" for lake_id in lake_ids}
+            for zone in sorted(z for z in zone_info.get("zone_to_nodes", {}) if int(z) != 0):
+                nodes = [str(node) for node in zone_info["zone_to_nodes"][zone] if str(node) in valid_nodes]
+                if not nodes:
+                    continue
+                f.write(f'  subgraph "cluster_zone_{int(zone)}" {{\n')
+                f.write(f'    label="Zone {int(zone)}";\n')
+                f.write('    color="black";\n')
+                f.write('    style="rounded";\n')
+                for node in nodes:
+                    f.write(f'    "{node}";\n')
+                f.write('  }\n')
+
         for r in rt.itertuples(index=False):
             a = int(r.segment)
             b = int(r.outseg_norm)
@@ -636,6 +861,7 @@ def main() -> None:
     ap.add_argument("--out-png", default=None, help="Optional rendered PNG output path.")
     ap.add_argument("--out-log", default=None, help="Optional text QC log output path.")
     ap.add_argument("--lak-input", default=None, help="Optional LAK input file used to add all lakes and sublake-system connections to the DOT/PNG output.")
+    ap.add_argument("--zone-input", default=None, help="Optional ZoneBudget zone input file used to draw Zone 1, Zone 2, etc. subgraph boxes around assigned segment/lake nodes.")
     ap.add_argument("--network-direction", default="LR", choices=["LR", "RL", "TB", "BT", "lr", "rl", "tb", "bt"], help="Graphviz network direction for DOT/PNG output.")
     ap.add_argument("--show-legend", action=argparse.BooleanOptionalAction, default=True, help="Show or hide the legend in the DOT/PNG output.")
     ap.add_argument("--show-qc-issues", action=argparse.BooleanOptionalAction, default=True, help="Highlight or suppress QC issues in the DOT/PNG output.")
@@ -644,6 +870,8 @@ def main() -> None:
     res = parse_routing_table(args.sfr_input)
     rt = res["routing_table"]
     lak_info = parse_lak_sublake_systems(args.lak_input) if args.lak_input else None
+    rt = update_hanging_subnetwork_flags(rt, lak_info=lak_info)
+    zone_info = parse_zone_input(args.zone_input) if args.zone_input else None
 
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
     rt.to_csv(args.out_csv, index=False)
@@ -658,10 +886,13 @@ def main() -> None:
     if lak_info:
         print(f"LAK NLAKES: {lak_info['nlakes']}")
         print(f"LAK NSLMS: {lak_info['nslms']}")
+    if zone_info:
+        visible_zones = sorted(z for z in zone_info.get("zone_to_nodes", {}) if int(z) != 0)
+        print(f"Zone file zones: {', '.join(str(z) for z in visible_zones) if visible_zones else 'none above 0'}")
     print(f"Wrote CSV: {args.out_csv}")
 
     if args.out_dot:
-        write_dot(rt, args.out_dot, args.network_direction, args.show_legend, args.show_qc_issues, lak_info)
+        write_dot(rt, args.out_dot, args.network_direction, args.show_legend, args.show_qc_issues, lak_info, zone_info)
         print(f"Wrote DOT: {args.out_dot}")
 
     if args.out_png:
@@ -669,7 +900,7 @@ def main() -> None:
         if not dot_for_render:
             root, _ = os.path.splitext(args.out_png)
             dot_for_render = root + ".dot"
-            write_dot(rt, dot_for_render, args.network_direction, args.show_legend, args.show_qc_issues, lak_info)
+            write_dot(rt, dot_for_render, args.network_direction, args.show_legend, args.show_qc_issues, lak_info, zone_info)
             print(f"Wrote DOT: {dot_for_render}")
         render_png_from_dot(dot_for_render, args.out_png)
         print(f"Wrote PNG: {args.out_png}")
@@ -682,20 +913,23 @@ def main() -> None:
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4.sfr"  # e.g. r"Y:\path\to\model.sfr"
+SFR_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test5\test5.sfr"  # e.g. r"Y:\path\to\model.sfr"
 # Optional LAK package input file. Provide this to add all lakes and sublake-system connections to the visualization.
 # Leave blank to use only lake connections that can be inferred from negative SFR OUTSEG/IUPSEG values.
-LAK_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4.lak"  # optional: r"Y:\path\to\model.lak"
+LAK_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test5\test5.lak"  # optional: r"Y:\path\to\model.lak"
+# Optional ZoneBudget zone input file. Provide this to draw Zone 1, Zone 2, etc. boxes around assigned nodes.
+# Leave blank to omit zone grouping from the visualization. Zone 0 assignments are not boxed.
+ZONE_INPUT_PATH = r"Y:\mbaillie\SFRZB\Test Models\test5\test5_zone_1segperzone.csv"  # optional: r"Y:\path\to\zones.txt"
 # Provide desired path for QC routing CSV file, leave blank to not print
-OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
+OUT_CSV_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test5\test5_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
 # Provide desired path for QC routing DOT file, leave blank to not print
-OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQC.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
+OUT_DOT_PATH   = r"Y:\mbaillie\SFRZB\Test Models\test5\test5_RoutingQC.dot"  # optional: r"Y:\path\to\routing.dot" (leave blank to skip)
 # NOTE that you must have the Graphviz system executable installed and available on your PATH to render the PNG.
 # Download at https://www.graphviz.org/download/
 # Otherwise, copy the contents of the .dot file into the input pane of https://dreampuf.github.io/GraphvizOnline/?engine=dot
 OUT_PNG_PATH   = r""  # optional: r"Y:\path\to\routing.png" (leave blank to skip)
 # Provide desired path for QC log text file, leave blank to not print
-OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\Test Models\test4\test4_RoutingQCLog.txt"
+OUT_LOG_PATH = r"Y:\mbaillie\SFRZB\Test Models\test5\test5_RoutingQCLog.txt"
 # Network diagram direction:
 #   "LR" = left to right
 #   "RL" = right to left
@@ -725,9 +959,15 @@ if __name__ == "__main__":
         rt = res["routing_table"]
         lak_path = LAK_INPUT_PATH.strip() if LAK_INPUT_PATH else ""
         lak_info = parse_lak_sublake_systems(lak_path) if lak_path else None
+        rt = update_hanging_subnetwork_flags(rt, lak_info=lak_info)
+        zone_path = ZONE_INPUT_PATH.strip() if ZONE_INPUT_PATH else ""
+        zone_info = parse_zone_input(zone_path) if zone_path else None
         if lak_info:
             print(f"LAK NLAKES: {lak_info['nlakes']}")
             print(f"LAK NSLMS: {lak_info['nslms']}")
+        if zone_info:
+            visible_zones = sorted(z for z in zone_info.get("zone_to_nodes", {}) if int(z) != 0)
+            print(f"Zone file zones: {', '.join(str(z) for z in visible_zones) if visible_zones else 'none above 0'}")
 
         os.makedirs(os.path.dirname(OUT_CSV_PATH) or ".", exist_ok=True)
         rt.to_csv(OUT_CSV_PATH, index=False)
@@ -737,7 +977,7 @@ if __name__ == "__main__":
         dot_path = OUT_DOT_PATH.strip() if OUT_DOT_PATH else ""
 
         if dot_path:
-            write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info)
+            write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info, zone_info)
             dot_written = True
             print(f"Wrote DOT: {dot_path}")
 
@@ -746,7 +986,7 @@ if __name__ == "__main__":
             if not dot_written:
                 root, _ = os.path.splitext(png_path)
                 dot_path = root + ".dot"
-                write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info)
+                write_dot(rt, dot_path, NETWORK_DIRECTION, SHOW_LEGEND, SHOW_QC_ISSUES, lak_info, zone_info)
                 print(f"Wrote DOT: {dot_path}")
 
             render_png_from_dot(dot_path, png_path)
