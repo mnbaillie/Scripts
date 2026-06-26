@@ -1,7 +1,7 @@
 Welcome to my script repository! This will contain public pre- and post-processing scripts that I've created for groundwater-surface water models.
 
  - sfr_routing_qc.py is intended to provide QC and a spatially-agnostic routing visualization of the stream network. This can be used on any MODFLOW model that uses SFR.
- - sfr_zonebudget.py generates a zonal surface water budget using the routing information in the SFR file, a user-supplied zone file, and the reach-by-reach streamflow file. This script can currently only be used with MODFLOW-OWHM models that use the DBFILE option in the SFR file.
+ - sfr_zonebudget.py generates a zonal surface water budget using the routing information in the SFR file, a user-supplied zone file, and the reach-by-reach streamflow file. This script can be used with MODFLOW-OWHM models that use the DBFILE option in the SFR file as well as MODFLOW-2005/NWT models that use the ISTCB2 option.
 
 Routing visualizations produced by these scripts use the Graphviz DOT language (https://graphviz.org/doc/info/lang.html). If the user does not have the Graphviz executable installed, the .dot file produced by the script can be copied to https://dreampuf.github.io/GraphvizOnline/?engine=dot to generate an image of the routing network.
 
