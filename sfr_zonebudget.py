@@ -10,8 +10,9 @@ components:
     - FLOW_HEAD: Streamflow entering the zone at headwater segments
     - ADDITIONAL_INFLOW: Prescribed FLOW entering non-head segments (for example,
                          FLOW specified on a segment that also receives routed flow)
-    - FLOW_SEEPAGE: Groundwater-surface water interaction (positive is loss to
-                    groundwater to match groundwater ZoneBudget sign convention)
+    - FLOW_SEEPAGE: Groundwater-surface water interaction from the stream
+                    perspective (positive is gain from groundwater; negative is
+                    loss from the stream to groundwater)
     - FLOW_OUTOFMODEL: Streamflow leaving the model domain from the zone
     - RUNOFF: Land surface runoff entering the stream network
     - FARM_DIVERSION_NET_QC: FMP diversions leaving the stream network
@@ -101,7 +102,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-1\modflow.sfr2"          # SFR input file (text)
+SFR_INPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\modflow.sfr2"          # SFR input file (text)
 
 # Optional LAK package input file (text). Leave blank if the model does not use LAK,
 # or if you only want routing inferred from the SFR file. When supplied, the script
@@ -118,9 +119,9 @@ LAK_INPUT_PATH = r""
 # (for example, Segment=-3 assigns Lake 3 to a zone).
 LAK_BUDGET_CSV_PATH = r""
 
-SFR_OUTPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-1\modflow.sfr2.list"  # SFR output file. Supported: OWHM DBFILE-style ASCII/binary reach table, positive-ISTCB2 formatted reach-by-reach listing, or normalized CSV; .zip supported for binary/DB output.
-ZONE_CONFIG_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\SFRZB_Zones_RipAreas_segrch.csv"       # by-segment or by-reach
-OUT_EXCEL_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-1\MSJCW-1_RipAreas_segrch.xlsx"
+SFR_OUTPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\modflow.sfr2.list"  # SFR output file. Supported: OWHM DBFILE-style ASCII/binary reach table, positive-ISTCB2 formatted reach-by-reach listing, or normalized CSV; .zip supported for binary/DB output.
+ZONE_CONFIG_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\SFRZB_Zones_Seg22byRIB.csv"       # by-segment or by-reach
+OUT_EXCEL_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\MSJCW-2_Seg22byRIB.xlsx"
 
 # Optional: choose where to write routing CSV (QC). If blank, writes next to OUT_EXCEL_PATH.
 OUT_ROUTING_CSV_PATH = r""  # e.g. r"Y:\path\to\routing.csv"
@@ -227,6 +228,20 @@ VOLUME_UNIT_LABEL = "ft^3"  # e.g., "ac-ft", "m^3"
 # =========================
 INT_PAT = re.compile(r'^[+-]?\d+$')
 FLOAT_PAT = re.compile(r'^[+-]?(\d+(\.\d*)?|\.\d+)([Ee][+-]?\d+)?$')
+
+
+_STATUS_WIDTH = 0
+
+def _status_echo(message: str = "", finish: bool = False) -> None:
+    """Print one in-place status line, overwriting the previous message."""
+    global _STATUS_WIDTH
+    text = str(message)
+    width = max(_STATUS_WIDTH, len(text))
+    print("\r" + text.ljust(width), end="\n" if finish else "", flush=True)
+    _STATUS_WIDTH = 0 if finish else width
+
+def _budget_timestep_status(per: int, stp: int) -> None:
+    _status_echo(f"Computing the budget for time step {int(stp)} in stress period {int(per)}.")
 
 
 def _strip_inline_comments(line: str) -> str:
@@ -1694,9 +1709,15 @@ def read_sfr_output_ascii_stream_compact(
     reach_transfer_parts: List[pd.DataFrame] = []
     endpoint_parts: List[pd.DataFrame] = []
     carry: Optional[pd.DataFrame] = None
+    reported_timesteps: Set[Tuple[int, int]] = set()
 
     def consume(chunk: pd.DataFrame) -> None:
         nonlocal carry
+        for per, stp in chunk[["PER", "STP"]].drop_duplicates().itertuples(index=False, name=None):
+            key = (int(per), int(stp))
+            if key not in reported_timesteps:
+                _budget_timestep_status(*key)
+                reported_timesteps.add(key)
         if zone_mode != "reach":
             parts.append(_compact_reach_rows(chunk))
             return
@@ -1787,6 +1808,9 @@ def read_sfr_output_ascii_stream_compact(
             for chunk in reader:
                 consume(_normalize(chunk, source_format='ascii_db'))
         fmt = "ascii_db"
+
+    if reported_timesteps:
+        _status_echo("SFR output processing complete.", finish=True)
 
     out = _combine_compact_parts(parts, fmt)
     if zone_mode == "reach":
@@ -2159,6 +2183,12 @@ def build_zonebudget_excel(
             PRECIP=("PRECIP","sum"),
             STREAM_ET=("STREAM_ET","sum"),
         )
+    # Reverse the native SFR sign so output is from the stream perspective:
+    # positive FLOW_SEEPAGE is gain from groundwater; negative is stream loss.
+    zone_reach_terms["FLOW_SEEPAGE"] = -pd.to_numeric(
+        zone_reach_terms["FLOW_SEEPAGE"], errors="coerce"
+    ).fillna(0.0)
+
     if isinstance(pre_farm_div_zone, pd.DataFrame):
         farm_div_zone = pre_farm_div_zone.copy()
     else:
@@ -2230,10 +2260,11 @@ def build_zonebudget_excel(
         out_cols = [f"OUT_TO_ZONE_{k}" for k in zones_list]
         ts["MASS_BALANCE_RESIDUAL"] = (
             ts["FLOW_HEAD"] + ts["ADDITIONAL_INFLOW"] + ts["RUNOFF"] + ts["PRECIP"]
+            + ts["FLOW_SEEPAGE"]
             + ts["LAK_PRECIP"] + ts["LAK_RUNOFF"] + ts["LAK_GW_INFLOW"]
             + ts[in_cols].sum(axis=1)
             - (
-                ts["FLOW_SEEPAGE"] + ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"]
+                ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"]
                 + ts["LAK_EVAP"] + ts["LAK_GW_OUTFLOW"] + ts["LAK_WATER_USE"] + ts["LAK_STORAGE_CHANGE"]
                 + ts[out_cols].sum(axis=1)
             )
@@ -2263,6 +2294,9 @@ def build_zonebudget_excel(
         PRECIP=("PRECIP","sum"),
         STREAM_ET=("STREAM_ET","sum"),
     )
+    sys_reach["FLOW_SEEPAGE"] = -pd.to_numeric(
+        sys_reach["FLOW_SEEPAGE"], errors="coerce"
+    ).fillna(0.0)
     sys_ts = sys_ts.merge(sys_reach, on=["PER","STP"], how="left")
 
     # Sum headwater external inflow across all segments
@@ -2298,9 +2332,10 @@ def build_zonebudget_excel(
     # System mass balance residual (no interzone terms; they cancel at system scale)
     sys_ts["MASS_BALANCE_RESIDUAL_SYSTEM"] = (
         sys_ts["FLOW_HEAD"] + sys_ts["ADDITIONAL_INFLOW"] + sys_ts["RUNOFF"] + sys_ts["PRECIP"]
+        + sys_ts["FLOW_SEEPAGE"]
         + sys_ts["LAK_PRECIP"] + sys_ts["LAK_RUNOFF"] + sys_ts["LAK_GW_INFLOW"]
         - (
-            sys_ts["FLOW_SEEPAGE"] + sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"]
+            sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"]
             + sys_ts["LAK_EVAP"] + sys_ts["LAK_GW_OUTFLOW"] + sys_ts["LAK_WATER_USE"] + sys_ts["LAK_STORAGE_CHANGE"]
         )
     )
@@ -2434,6 +2469,7 @@ def build_zonebudget_excel(
         ("Diversion caveat", "RUNOFF at diversion sources may include natural runoff (+) and diversion (-); FARM_DIVERSION_NET=max(0,-RUNOFF) is a net indicator, not guaranteed gross diversion."),
         ("Additional inflow method", "For non-head segments, ADDITIONAL_INFLOW=max(0, segment FLOW_IN - routed upstream stream inflow - lake-to-stream inflow - SFR diversion inflow). This captures prescribed FLOW from SFR Data Set 6a at non-head locations, including tabfile-driven FLOW, without reading tabfiles."),
         ("Additional inflow tolerance", ADDITIONAL_INFLOW_TOLERANCE),
+        ("FLOW_SEEPAGE sign convention", "Stream perspective: positive is gain from groundwater; negative is loss from stream to groundwater."),
         ("Output basis", OUTPUT_BASIS),
         ("Model length unit", MODEL_LENGTH_UNIT),
         ("Output volume unit", OUTPUT_VOLUME_UNIT),
