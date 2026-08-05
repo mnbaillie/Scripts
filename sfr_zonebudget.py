@@ -10,9 +10,8 @@ components:
     - FLOW_HEAD: Streamflow entering the zone at headwater segments
     - ADDITIONAL_INFLOW: Prescribed FLOW entering non-head segments (for example,
                          FLOW specified on a segment that also receives routed flow)
-    - FLOW_SEEPAGE: Groundwater-surface water interaction from the stream
-                    perspective (positive is gain from groundwater; negative is
-                    loss from the stream to groundwater)
+    - FLOW_SEEPAGE: Groundwater-surface water interaction (positive is loss to
+                    groundwater to match groundwater ZoneBudget sign convention)
     - FLOW_OUTOFMODEL: Streamflow leaving the model domain from the zone
     - RUNOFF: Land surface runoff entering the stream network
     - FARM_DIVERSION_NET_QC: FMP diversions leaving the stream network
@@ -43,8 +42,7 @@ ZoneBudget-style surface-water balance for MODFLOW (MF-2005 lineage) SFR "DB" ou
 Key features
 ------------
 - Reads SFR input file (SFR2-style) to build a segment routing table (stress period 1),
-  and writes routing CSV/DOT outputs for QC. The DOT routing diagram automatically
-  shows ZoneBudget zones when ZONE_CONFIG_PATH is supplied.
+  and writes a routing CSV for QC.
 - Reads SFR output file:
     * ASCII table (whitespace- or comma-delimited), OR
     * Binary fixed-length record table like USGS "DB" binary (DATE_START + ints + doubles).
@@ -74,9 +72,9 @@ IMPORTANT NOTES
 ---------------
 - Diversion transfers are NET indicators (derived from negative RUNOFF), not guaranteed
   to equal "gross diversion". See README_METADATA in the output workbook.
-- Interzone transfers support both segment boundaries and reach boundaries. In by-reach
-  mode, every consecutive-reach zone change is tracked using the upstream reach FLOW_OUT;
-  segment-to-segment, SFR-diversion, and stream-lake connections use endpoint reach zones.
+- Interzone downstream transfers are computed at the SEGMENT level using segment outflow
+  (FLOW_OUT at last reach). This is typically correct for routing boundaries; if you
+  need reach-level boundary routing, we can extend using reach connectivity.
 
 USER SETTINGS (EDIT THESE)
 --------------------------
@@ -89,9 +87,9 @@ import os
 import re
 import zipfile
 import struct
-from io import StringIO, TextIOWrapper
+from io import StringIO
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -102,7 +100,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # =========================
 # USER SETTINGS (EDIT ME)
 # =========================
-SFR_INPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\modflow.sfr2"          # SFR input file (text)
+SFR_INPUT_PATH = r"Y:\mbaillie\Model Library\CVHM\CVHM_archive_input\CentralValleyModelFiles_PP-1766_Input\input\SFR.txt"          # SFR input file (text)
 
 # Optional LAK package input file (text). Leave blank if the model does not use LAK,
 # or if you only want routing inferred from the SFR file. When supplied, the script
@@ -119,37 +117,22 @@ LAK_INPUT_PATH = r""
 # (for example, Segment=-3 assigns Lake 3 to a zone).
 LAK_BUDGET_CSV_PATH = r""
 
-SFR_OUTPUT_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\modflow.sfr2.list"  # SFR output file. Supported: OWHM DBFILE-style ASCII/binary reach table, positive-ISTCB2 formatted reach-by-reach listing, or normalized CSV; .zip supported for binary/DB output.
-ZONE_CONFIG_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\SFRZB_Zones_Seg22byRIB.csv"       # by-segment or by-reach
-OUT_EXCEL_PATH = r"Y:\mbaillie\SMWD\Scenarios\Fatal Flaw\4b4-hd-MSJCW-2\MSJCW-2_Seg22byRIB.xlsx"
+SFR_OUTPUT_PATH = r"Y:\mbaillie\Model Library\CVHM\CVHM_archive_input\CentralValleyModelFiles_PP-1766_Input\output\sfrout.rbr"  # SFR output file. Supported: OWHM DBFILE-style ASCII/binary reach table, positive-ISTCB2 formatted reach-by-reach listing, or normalized CSV; .zip supported for binary/DB output.
+ZONE_CONFIG_PATH = r"Y:\mbaillie\SFRZB\Examples\CVHM_zone_all1zone.csv"       # by-segment or by-reach
+OUT_EXCEL_PATH = r"Y:\mbaillie\SFRZB\Examples\CVHM_SFRZB_all1zone.xlsx"
 
 # Optional: choose where to write routing CSV (QC). If blank, writes next to OUT_EXCEL_PATH.
-OUT_ROUTING_CSV_PATH = r""  # e.g. r"Y:\path\to\routing.csv"
+OUT_ROUTING_CSV_PATH = r"Y:\mbaillie\SFRZB\Examples\CVHM_SFRZB_all1zone_RoutingQC.csv"  # e.g. r"Y:\path\to\routing.csv"
 
 # Optional: choose where to write a lake-aware routing edge list (QC). If blank, writes
 # next to OUT_ROUTING_CSV_PATH using the suffix _edges.csv. This file includes
 # stream-to-stream, stream-to-lake, lake-to-stream, and LAK sublake-system edges.
 OUT_ROUTING_EDGES_CSV_PATH = r""
 
-# Optional: choose where to write the routing diagram DOT file. If blank, writes
-# next to OUT_ROUTING_CSV_PATH using the suffix _diagram.dot. Because this
-# ZoneBudget script already requires a zone file, zones are automatically shown
-# on the routing diagram using black boxed subgraphs. Zone 0 is not boxed.
-OUT_ROUTING_DOT_PATH = r""
-
-# Optional: choose where to render the routing diagram PNG file. Leave blank to
-# skip PNG rendering. Requires the graphviz Python package and Graphviz system
-# executable on PATH.
-OUT_ROUTING_PNG_PATH = r""
-
-# Graphviz network diagram direction: "LR", "RL", "TB", or "BT".
-NETWORK_DIRECTION = "TB"
-
-# Show the legend in the DOT/PNG routing visualization. Set to False for no legend.
-SHOW_LEGEND = True
-
-# Highlight potential QC issues in the DOT/PNG routing visualization. Set to False for a clean visualization.
-SHOW_QC_ISSUES = True
+# Optional: choose where to write the lake-aware routing diagram. If blank, writes
+# next to OUT_ROUTING_EDGES_CSV_PATH using the suffix _diagram.png. The diagram
+# automatically labels/colors nodes by the supplied zone configuration file.
+OUT_ROUTING_DIAGRAM_PATH = r""
 
 # If your SFR output is zipped and contains multiple files, set this to the member name.
 # If blank, the script will use the first member in the zip.
@@ -228,20 +211,6 @@ VOLUME_UNIT_LABEL = "ft^3"  # e.g., "ac-ft", "m^3"
 # =========================
 INT_PAT = re.compile(r'^[+-]?\d+$')
 FLOAT_PAT = re.compile(r'^[+-]?(\d+(\.\d*)?|\.\d+)([Ee][+-]?\d+)?$')
-
-
-_STATUS_WIDTH = 0
-
-def _status_echo(message: str = "", finish: bool = False) -> None:
-    """Print one in-place status line, overwriting the previous message."""
-    global _STATUS_WIDTH
-    text = str(message)
-    width = max(_STATUS_WIDTH, len(text))
-    print("\r" + text.ljust(width), end="\n" if finish else "", flush=True)
-    _STATUS_WIDTH = 0 if finish else width
-
-def _budget_timestep_status(per: int, stp: int) -> None:
-    _status_echo(f"Computing the budget for time step {int(stp)} in stress period {int(per)}.")
 
 
 def _strip_inline_comments(line: str) -> str:
@@ -377,102 +346,6 @@ def find_segment_block_start(lines: List[str], nstrm: int, counts_idx: int) -> i
     raise ValueError("Could not locate the start of the segment data block (stress period 1).")
 
 
-
-def _build_undirected_adjacency(rt: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> Dict[str, Set[str]]:
-    """Build an undirected topology graph for hanging-subnetwork QC.
-
-    The QC test is meant to find truly disconnected routing fragments. A stream
-    segment that routes into or out of a lake is not disconnected, even though
-    that connection is stored as a negative OUTSEG/IUPSEG rather than a positive
-    stream segment number. Therefore, this graph includes virtual LAKE_n nodes
-    and, when LAK sublake-system information is available, lake-to-lake links
-    through those sublake systems.
-    """
-    adj: Dict[str, Set[str]] = {f"SFR_{int(seg)}": set() for seg in rt["segment"].tolist()}
-
-    def add_edge(a: str, b: str) -> None:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    for r in rt.itertuples(index=False):
-        a = f"SFR_{int(r.segment)}"
-        outseg = int(r.outseg)
-        iupseg = int(r.iupseg)
-
-        if outseg > 0:
-            add_edge(a, f"SFR_{outseg}")
-        elif outseg < 0:
-            add_edge(a, f"LAKE_{abs(outseg)}")
-
-        if iupseg > 0:
-            add_edge(a, f"SFR_{iupseg}")
-        elif iupseg < 0:
-            add_edge(a, f"LAKE_{abs(iupseg)}")
-
-    if lak_info:
-        for lake_id in range(1, int(lak_info.get("nlakes", 0) or 0) + 1):
-            adj.setdefault(f"LAKE_{lake_id}", set())
-        for sys in lak_info.get("sublake_systems", []):
-            lakes = sys.get("sublakes", sys.get("lake_ids", []))
-            lakes = [int(x) for x in lakes]
-            if len(lakes) < 2:
-                continue
-            anchor = f"LAKE_{lakes[0]}"
-            for lake in lakes[1:]:
-                add_edge(anchor, f"LAKE_{lake}")
-
-    return adj
-
-
-def _connected_components(adj: Dict[str, Set[str]]) -> List[Set[str]]:
-    seen: Set[int] = set()
-    comps: List[Set[int]] = []
-    for start in adj:
-        if start in seen:
-            continue
-        stack = [start]
-        comp: Set[int] = set()
-        seen.add(start)
-        while stack:
-            cur = stack.pop()
-            comp.add(cur)
-            for nxt in adj[cur]:
-                if nxt not in seen:
-                    seen.add(nxt)
-                    stack.append(nxt)
-        comps.append(comp)
-    return comps
-
-
-def identify_hanging_subnetworks(rt: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> Set[int]:
-    """Flag small disconnected subnetworks for routing QC highlighting.
-
-    Lake-mediated connections are included so upstream streams that drain to a
-    lake, and streams that receive outflow from a lake, are not falsely treated
-    as separate hanging networks.
-    """
-    n_total = len(rt)
-    if n_total <= 2:
-        return set()
-    adj = _build_undirected_adjacency(rt, lak_info=lak_info)
-    comps = _connected_components(adj)
-    if len(comps) <= 1:
-        return set()
-
-    largest = max(len(c) for c in comps)
-    flagged: Set[int] = set()
-    for comp in comps:
-        size = len(comp)
-        if size == largest:
-            continue
-        if size == 1 or size == 2 or size < 0.10 * n_total:
-            for node in comp:
-                if str(node).startswith("SFR_"):
-                    tail = str(node).replace("SFR_", "", 1)
-                    if tail.isdigit():
-                        flagged.add(int(tail))
-    return flagged
-
 def parse_sfr_routing_table(sfr_input_path: str) -> Dict:
     with open(sfr_input_path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
@@ -525,15 +398,6 @@ def parse_sfr_routing_table(sfr_input_path: str) -> Dict:
     )
     rt["is_head_segment"] = ~rt["segment"].astype(int).isin(inflow_targets)
 
-    hanging_segments = identify_hanging_subnetworks(rt)
-    rt["is_hanging_subnetwork"] = rt["segment"].astype(int).isin(hanging_segments)
-    rt["has_reverse_downstream_connection"] = (
-        (rt["outseg_norm"] > 0) & (rt["segment"] > rt["outseg_norm"])
-    )
-    rt["has_reverse_diversion_connection"] = (
-        (rt["iupseg_norm"] > 0) & (rt["iupseg_norm"] > rt["segment"])
-    )
-
     return dict(
         nstrm=nstrm,
         nss=nss,
@@ -543,13 +407,6 @@ def parse_sfr_routing_table(sfr_input_path: str) -> Dict:
         routing_table=rt,
     )
 
-
-def update_hanging_subnetwork_flags(rt: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    """Recompute hanging-subnetwork flags with optional LAK connectivity."""
-    rt = rt.copy()
-    hanging_segments = identify_hanging_subnetworks(rt, lak_info=lak_info)
-    rt["is_hanging_subnetwork"] = rt["segment"].astype(int).isin(hanging_segments)
-    return rt
 
 
 def parse_lak_sublake_systems(lak_input_path: str) -> Dict[str, Any]:
@@ -676,6 +533,13 @@ def build_routing_edges_table(routing: pd.DataFrame, lak_info: Optional[Dict[str
     Node IDs are strings so lakes and stream segments remain explicit:
       - SFR segment 12 -> "SFR_12"
       - Lake 3        -> "LAKE_3"
+
+    Routing semantics:
+      - OUTSEG > 0 is an SFR-to-SFR edge.
+      - OUTSEG = 0 is an external model exit and is not drawn as a node edge.
+      - OUTSEG < 0 is an SFR-to-lake edge, not a model exit.
+      - IUPSEG < 0 is a lake-to-SFR edge, not headwater inflow.
+      - LAK sublake-system edges are topology/QC edges only.
     """
     rows: List[Dict[str, Any]] = []
     rt = routing.copy()
@@ -688,9 +552,7 @@ def build_routing_edges_table(routing: pd.DataFrame, lak_info: Optional[Dict[str
         elif outseg < 0:
             lake = abs(outseg)
             rows.append(dict(from_node=f"SFR_{seg}", to_node=f"LAKE_{lake}", from_type="SFR", to_type="LAKE", edge_type="SFR_TO_LAKE_OUTSEG", from_id=seg, to_id=lake))
-        if iupseg > 0:
-            rows.append(dict(from_node=f"SFR_{iupseg}", to_node=f"SFR_{seg}", from_type="SFR", to_type="SFR", edge_type="SFR_DIVERSION", from_id=iupseg, to_id=seg))
-        elif iupseg < 0:
+        if iupseg < 0:
             lake = abs(iupseg)
             rows.append(dict(from_node=f"LAKE_{lake}", to_node=f"SFR_{seg}", from_type="LAKE", to_type="SFR", edge_type="LAKE_TO_SFR_IUPSEG", from_id=lake, to_id=seg))
 
@@ -712,12 +574,144 @@ def build_routing_edges_table(routing: pd.DataFrame, lak_info: Optional[Dict[str
                     sublake_system_id=int(sys.get("system_id", 0)),
                 ))
 
+    cols = ["from_node","to_node","from_type","to_type","edge_type","from_id","to_id","sublake_system_id"]
     if not rows:
-        return pd.DataFrame(columns=["from_node","to_node","from_type","to_type","edge_type","from_id","to_id","sublake_system_id"])
+        return pd.DataFrame(columns=cols)
     edges = pd.DataFrame(rows)
     if "sublake_system_id" not in edges.columns:
         edges["sublake_system_id"] = np.nan
-    return edges[["from_node","to_node","from_type","to_type","edge_type","from_id","to_id","sublake_system_id"]]
+    return edges[cols]
+
+
+def build_node_zone_lookup(zone_mode: str, zones: pd.DataFrame) -> Dict[str, str]:
+    """Return node_id -> zone label for routing QC/diagram output.
+
+    For by-segment zone files, positive Segment rows map SFR segments and
+    negative Segment rows map lakes. For by-reach zone files, SFR segment nodes
+    are labelled with a single zone when all reaches agree, or "mixed:..." when
+    a segment spans more than one reach zone. Lakes cannot be assigned in
+    by-reach files and default to Zone 0 in the diagram.
+    """
+    lookup: Dict[str, str] = {}
+    if zone_mode == "segment":
+        for r in zones.itertuples(index=False):
+            seg = int(r.segment)
+            z = str(int(r.zone))
+            if seg > 0:
+                lookup[f"SFR_{seg}"] = z
+            elif seg < 0:
+                lookup[f"LAKE_{abs(seg)}"] = z
+    else:
+        for seg, sub in zones.groupby("segment"):
+            vals = sorted(set(int(x) for x in sub["zone"].dropna().tolist()))
+            if len(vals) == 1:
+                lookup[f"SFR_{int(seg)}"] = str(vals[0])
+            elif vals:
+                lookup[f"SFR_{int(seg)}"] = "mixed:" + ",".join(str(v) for v in vals)
+    return lookup
+
+
+def add_zone_labels_to_routing_edges(edges: pd.DataFrame, zone_mode: str, zones: pd.DataFrame) -> pd.DataFrame:
+    """Add from_zone/to_zone columns to the routing edge table for QC.
+
+    Zones are applied automatically from the zone configuration file. Any node
+    not explicitly represented in the zone configuration is assigned Zone 0.
+    """
+    out = edges.copy()
+    node_zone = build_node_zone_lookup(zone_mode, zones)
+    for col in ["from_node", "to_node"]:
+        if col not in out.columns:
+            out[col] = ""
+    out["from_zone"] = out["from_node"].map(node_zone).fillna("0")
+    out["to_zone"] = out["to_node"].map(node_zone).fillna("0")
+    return out
+
+
+def write_routing_diagram(edges: pd.DataFrame, zone_mode: str, zones: pd.DataFrame, out_path: str) -> Optional[str]:
+    """Write a lake-aware routing diagram with zone labels.
+
+    The diagram is intentionally generated from the same edge table used for QC,
+    so stream-to-lake and lake-to-stream routing are shown explicitly. Zones are
+    always labelled when a zone file is supplied; no separate display option is
+    needed.
+    """
+    if edges is None or edges.empty:
+        return None
+    if not out_path:
+        return None
+
+    node_zone = build_node_zone_lookup(zone_mode, zones)
+    base, ext = os.path.splitext(out_path)
+    if not ext:
+        ext = ".png"
+        out_path = base + ext
+    fmt = ext.lower().lstrip(".") or "png"
+    if fmt == "jpg":
+        fmt = "jpeg"
+
+    dot_path = base + ".dot"
+
+    # Deterministic, dependency-light DOT writer. If the graphviz Python package
+    # and Graphviz executable are available, also render the requested image/PDF.
+    def q(x: Any) -> str:
+        return '"' + str(x).replace('"', r'\"') + '"'
+
+    nodes = sorted(set(edges["from_node"].astype(str)).union(set(edges["to_node"].astype(str))))
+    zone_values = sorted(set(node_zone.get(n, "0") for n in nodes))
+    # Soft pastel palette. Reused cyclically if many zones are present.
+    palette = [
+        "#d9e8fb", "#dff2df", "#fff0cc", "#f7d9d9", "#eadcf8",
+        "#d9f1f2", "#f6e2c6", "#e8e8e8", "#cfe8d5", "#f2d9e6",
+    ]
+    zone_color = {z: palette[i % len(palette)] for i, z in enumerate(zone_values)}
+
+    lines = [
+        "digraph SFR_ZoneBudget_Routing {",
+        "  graph [rankdir=LR, overlap=false, splines=true];",
+        "  node [style=filled, fontname=Helvetica, fontsize=10];",
+        "  edge [fontname=Helvetica, fontsize=9];",
+    ]
+    for node in nodes:
+        zone = node_zone.get(node, "0")
+        if node.startswith("LAKE_"):
+            label = node.replace("LAKE_", "Lake ") + f"\\nZone {zone}"
+            shape = "ellipse"
+        elif node.startswith("SFR_"):
+            label = node.replace("SFR_", "SFR ") + f"\\nZone {zone}"
+            shape = "box"
+        else:
+            label = node + f"\\nZone {zone}"
+            shape = "box"
+        lines.append(f"  {q(node)} [label={q(label)}, shape={shape}, fillcolor={q(zone_color.get(zone, '#e8e8e8'))}];")
+
+    for r in edges.itertuples(index=False):
+        attrs = []
+        etype = str(getattr(r, "edge_type", ""))
+        if etype == "LAK_SUBLAKE_SYSTEM":
+            attrs.append('style="dashed"')
+            attrs.append('label="connected lakes"')
+        elif etype == "SFR_TO_LAKE_OUTSEG":
+            attrs.append('label="SFR→LAK"')
+        elif etype == "LAKE_TO_SFR_IUPSEG":
+            attrs.append('label="LAK→SFR"')
+        elif etype == "SFR_OUTSEG":
+            attrs.append('label="SFR"')
+        attr_txt = " [" + ", ".join(attrs) + "]" if attrs else ""
+        lines.append(f"  {q(r.from_node)} -> {q(r.to_node)}{attr_txt};")
+    lines.append("}")
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(dot_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    try:
+        from graphviz import Source
+        src = Source.from_file(dot_path)
+        rendered = src.render(filename=base, format=fmt, cleanup=True)
+        return rendered
+    except Exception as e:
+        print(f"WARNING: Could not render routing diagram with Graphviz ({e}). Wrote DOT file instead: {dot_path}")
+        return dot_path
 
 
 def build_lake_routing_qc(routing: pd.DataFrame, lak_info: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -838,271 +832,6 @@ def read_zone_config(zone_path: str) -> Tuple[str, pd.DataFrame]:
         return "segment", z[required].copy()
 
 
-
-
-def build_routing_zone_info(zone_mode: str, zones: pd.DataFrame) -> Dict[str, Any]:
-    """Build Graphviz node-to-zone assignments from the ZoneBudget zone file.
-
-    Segment nodes are named SFR_<segment>. Lake nodes are named LAKE_<lake>.
-    In by-segment files, negative Segment values assign lakes to zones. Zone 0
-    and unassigned nodes are intentionally omitted from boxed subgraphs.
-
-    For by-reach files, the routing diagram is segment-level. A segment is boxed
-    only when all listed reaches for that segment use the same nonzero zone;
-    mixed-zone segments are left unboxed and reported in warnings.
-    """
-    assignments: Dict[str, int] = {}
-    warnings: List[str] = []
-
-    if zone_mode == "segment":
-        for r in zones.itertuples(index=False):
-            seg = int(r.segment)
-            zone = int(r.zone)
-            if zone == 0:
-                continue
-            node_id = f"LAKE_{abs(seg)}" if seg < 0 else f"SFR_{seg}"
-            assignments[node_id] = zone
-    else:
-        for seg, sub in zones.groupby("segment"):
-            zvals = sorted(set(int(z) for z in sub["zone"].dropna().tolist()))
-            nonzero = [z for z in zvals if z != 0]
-            if len(nonzero) == 1 and len(zvals) == 1:
-                assignments[f"SFR_{int(seg)}"] = int(nonzero[0])
-            elif len(nonzero) == 1 and zvals == [0, nonzero[0]]:
-                warnings.append(
-                    f"Segment {int(seg)} has both Zone 0 and Zone {int(nonzero[0])} reach assignments; left unboxed in the routing diagram."
-                )
-            elif len(nonzero) > 1:
-                warnings.append(
-                    f"Segment {int(seg)} has reaches in multiple zones ({', '.join(str(z) for z in nonzero)}); left unboxed in the routing diagram."
-                )
-
-    zone_to_nodes: Dict[int, List[str]] = {}
-    for node_id, zone in assignments.items():
-        if int(zone) == 0:
-            continue
-        zone_to_nodes.setdefault(int(zone), []).append(node_id)
-
-    for zone in zone_to_nodes:
-        zone_to_nodes[zone] = sorted(zone_to_nodes[zone], key=_routing_node_sort_key)
-
-    return {"assignments": assignments, "zone_to_nodes": zone_to_nodes, "warnings": warnings}
-
-
-def _routing_node_sort_key(node_id: str) -> Tuple[int, int, str]:
-    if node_id.startswith("SFR_"):
-        tail = node_id.replace("SFR_", "", 1)
-        return (0, int(tail) if tail.isdigit() else 0, node_id)
-    if node_id.startswith("LAKE_"):
-        tail = node_id.replace("LAKE_", "", 1)
-        return (1, int(tail) if tail.isdigit() else 0, node_id)
-    return (2, 0, node_id)
-
-
-def _dot_node_name(node_id: str) -> str:
-    return '"' + str(node_id).replace('"', '\\"') + '"'
-
-
-def _dot_label(text: str) -> str:
-    return str(text).replace('"', '\\"')
-
-
-def _routing_node_attrs(
-    node: str,
-    routing_by_node: Dict[str, Any],
-    show_qc_issues: bool,
-) -> List[str]:
-    label = node.replace("SFR_", "Segment ").replace("LAKE_", "Lake ")
-    attrs = [f'label="{_dot_label(label)}"']
-
-    if node.startswith("LAKE_"):
-        attrs.append("shape=doubleoctagon")
-        return attrs
-
-    attrs.append("shape=box")
-    r = routing_by_node.get(node)
-    if r is None:
-        return attrs
-
-    if bool(getattr(r, "is_diversion_segment", False)):
-        attrs = [a for a in attrs if a != "shape=box"]
-        attrs.append("shape=diamond")
-
-    styles: List[str] = []
-    if bool(getattr(r, "is_head_segment", False)):
-        styles.append("rounded")
-    if show_qc_issues and (
-        bool(getattr(r, "is_hanging_subnetwork", False))
-        or bool(getattr(r, "has_reverse_downstream_connection", False))
-        or bool(getattr(r, "has_reverse_diversion_connection", False))
-    ):
-        styles.append("filled")
-        attrs.append('fillcolor="#f4cccc"')
-        attrs.append('color="#cc0000"')
-    if styles:
-        attrs.append(f'style="{",".join(styles)}"')
-    if bool(getattr(r, "is_out_of_model", False)):
-        attrs.append("peripheries=2")
-    return attrs
-
-
-def write_routing_dot(
-    routing: pd.DataFrame,
-    routing_edges: pd.DataFrame,
-    out_dot: str,
-    zone_info: Optional[Dict[str, Any]] = None,
-    lak_info: Optional[Dict[str, Any]] = None,
-    network_direction: str = "TB",
-    show_legend: bool = True,
-    show_qc_issues: bool = True,
-) -> None:
-    """Write a Graphviz routing diagram with legend, QC highlighting, and ZoneBudget zone boxes."""
-    os.makedirs(os.path.dirname(out_dot) or ".", exist_ok=True)
-
-    network_direction = str(network_direction).upper().strip()
-    if network_direction not in {"LR", "RL", "TB", "BT"}:
-        raise ValueError("NETWORK_DIRECTION must be one of: LR, RL, TB, BT")
-
-    routing = routing.copy()
-    routing_by_node: Dict[str, Any] = {f"SFR_{int(r.segment)}": r for r in routing.itertuples(index=False)}
-    diversion_nodes = {
-        f"SFR_{int(r.segment)}" for r in routing.itertuples(index=False)
-        if bool(getattr(r, "is_diversion_segment", False))
-    }
-    hanging_nodes = {
-        f"SFR_{int(r.segment)}" for r in routing.itertuples(index=False)
-        if bool(getattr(r, "is_hanging_subnetwork", False))
-    }
-
-    nodes: Set[str] = set(routing_by_node.keys())
-    if routing_edges is not None and not routing_edges.empty:
-        nodes.update(str(x) for x in routing_edges["from_node"].dropna().tolist())
-        nodes.update(str(x) for x in routing_edges["to_node"].dropna().tolist())
-
-    if lak_info and int(lak_info.get("nlakes", 0) or 0) > 0:
-        for lake_id in range(1, int(lak_info.get("nlakes", 0)) + 1):
-            nodes.add(f"LAKE_{lake_id}")
-
-    zone_to_nodes = (zone_info or {}).get("zone_to_nodes", {}) if zone_info else {}
-    boxed_nodes: Set[str] = set()
-    for zone, znodes in zone_to_nodes.items():
-        if int(zone) == 0:
-            continue
-        for node in znodes:
-            if str(node) in nodes:
-                boxed_nodes.add(str(node))
-
-    with open(out_dot, "w", encoding="utf-8") as f:
-        f.write("digraph SFR_ZoneBudget_Routing {\n")
-        f.write(f'  rankdir="{network_direction}";\n')
-        f.write('  node [shape=box, fontname="Helvetica"];\n')
-        f.write('  edge [fontname="Helvetica"];\n')
-        f.write("\n")
-
-        if show_legend:
-            f.write("  subgraph cluster_legend {\n")
-            f.write('    label="Legend";\n')
-            f.write('    fontsize=12;\n')
-            f.write('    color="gray60";\n')
-            f.write('    style="rounded";\n')
-            f.write('    legend_normal [label="Normal segment", shape=box];\n')
-            f.write('    legend_div [label="Diversion segment", shape=diamond];\n')
-            f.write('    legend_lake [label="Lake", shape=doubleoctagon];\n')
-            f.write('    legend_head [label="Head segment", shape=box, style="rounded"];\n')
-            f.write('    legend_out [label="Out of model", shape=box, peripheries=2];\n')
-            f.write('    legend_zone [label="Zone box", shape=box, style="rounded"];\n')
-            if show_qc_issues:
-                f.write('    legend_qc [label="Potential QC issue", shape=box, style="filled", fillcolor="#f4cccc", color="#cc0000"];\n')
-            f.write('    legend_a [label="", shape=point, width=0.01];\n')
-            f.write('    legend_b [label="", shape=point, width=0.01];\n')
-            f.write('    legend_c [label="", shape=point, width=0.01];\n')
-            f.write('    legend_d [label="", shape=point, width=0.01];\n')
-            f.write('    legend_a -> legend_b [label="Downstream connection"];\n')
-            f.write('    legend_b -> legend_c [label="Diversion or diversion-adjacent connection", style=dashed];\n')
-            f.write('    legend_c -> legend_d [label="Lake connection", style=bold];\n')
-            if lak_info and lak_info.get("sublake_systems"):
-                f.write('    legend_sublake_a [label="", shape=point, width=0.01];\n')
-                f.write('    legend_sublake_b [label="", shape=point, width=0.01];\n')
-                f.write('    legend_sublake_a -> legend_sublake_b [label="Sublake-system connection", style=dashed, dir=none];\n')
-            f.write("  }\n\n")
-
-        # Zone boxes. Zone 0 and unassigned nodes intentionally remain outside clusters.
-        for zone in sorted(int(z) for z in zone_to_nodes if int(z) != 0):
-            znodes = [str(n) for n in zone_to_nodes.get(zone, []) if str(n) in nodes]
-            if not znodes:
-                continue
-            f.write(f'  subgraph "cluster_zone_{zone}" {{\n')
-            f.write(f'    label="Zone {zone}";\n')
-            f.write('    color="black";\n')
-            f.write('    style="rounded";\n')
-            for node in sorted(znodes, key=_routing_node_sort_key):
-                attrs = _routing_node_attrs(node, routing_by_node, show_qc_issues)
-                f.write(f'    {_dot_node_name(node)} [{", ".join(attrs)}];\n')
-            f.write("  }\n\n")
-
-        # Nodes not placed inside a visible zone box.
-        for node in sorted(nodes - boxed_nodes, key=_routing_node_sort_key):
-            attrs = _routing_node_attrs(node, routing_by_node, show_qc_issues)
-            f.write(f'  {_dot_node_name(node)} [{", ".join(attrs)}];\n')
-        f.write("\n")
-
-        if routing_edges is not None and not routing_edges.empty:
-            for r in routing_edges.itertuples(index=False):
-                from_node = str(r.from_node)
-                to_node = str(r.to_node)
-                edge_type = str(r.edge_type)
-                attrs: List[str] = []
-                if edge_type == "LAK_SUBLAKE_SYSTEM":
-                    attrs.extend(["style=dashed", "dir=none"])
-                    sid = getattr(r, "sublake_system_id", None)
-                    if sid is not None and not pd.isna(sid):
-                        attrs.append(f'label="sublake system {int(sid)}"')
-                elif edge_type in {"SFR_TO_LAKE_OUTSEG", "LAKE_TO_SFR_IUPSEG"}:
-                    attrs.append("style=bold")
-                elif edge_type == "SFR_DIVERSION":
-                    attrs.extend(["style=dashed", 'label="diversion"'])
-                elif from_node in diversion_nodes or to_node in diversion_nodes:
-                    attrs.append("style=dashed")
-
-                if show_qc_issues:
-                    if from_node.startswith("SFR_") and to_node.startswith("SFR_"):
-                        a_txt = from_node.replace("SFR_", "", 1)
-                        b_txt = to_node.replace("SFR_", "", 1)
-                        if a_txt.isdigit() and b_txt.isdigit():
-                            a = int(a_txt)
-                            b = int(b_txt)
-                            reverse = a > b
-                            hanging_pair = from_node in hanging_nodes and to_node in hanging_nodes
-                            if reverse or hanging_pair:
-                                attrs.append('color="#cc0000"')
-                                attrs.append("penwidth=2")
-
-                if attrs:
-                    f.write(f'  {_dot_node_name(from_node)} -> {_dot_node_name(to_node)} [{", ".join(attrs)}];\n')
-                else:
-                    f.write(f'  {_dot_node_name(from_node)} -> {_dot_node_name(to_node)};\n')
-
-        f.write("}\n")
-
-def render_routing_png_from_dot(out_dot: str, out_png: str) -> None:
-    try:
-        import graphviz  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError(
-            "Python package 'graphviz' is not installed. Install it with 'pip install graphviz' "
-            "or 'conda install python-graphviz'."
-        ) from exc
-
-    os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
-    try:
-        src = graphviz.Source.from_file(out_dot)
-        src.render(outfile=out_png, format="png", cleanup=False)
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to render routing PNG with Graphviz. Make sure the Graphviz executables "
-            "are installed and available on PATH."
-        ) from exc
-
 def read_lake_budget_csv(path: str) -> Optional[pd.DataFrame]:
     """Read normalized LAK-budget CSV from the companion listing-file scraper.
 
@@ -1179,7 +908,7 @@ DB_TAIL_COLS = [
 ]
 REQ = ['PER','STP','SEG','RCH','FLOW_IN','FLOW_SEEPAGE','FLOW_OUT','RUNOFF','PRECIP','STREAM_ET']
 
-_HEADER_RE = re.compile(r"STREAM\s+LISTING\s+PERIOD\s+(\d+)\s+STEP\s+(\d+)", re.I)
+_HEADER_RE = re.compile(r"(?:STREAM\s+LISTING|STREAMFLOW\s+OUT)\s+PERIOD\s+(\d+)\s+STEP\s+(\d+)", re.I)
 _NUM_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?$")
 
 
@@ -1454,7 +1183,7 @@ def _normalize(df: pd.DataFrame, source_format: str) -> pd.DataFrame:
 def read_sfr_output_any_bytes(raw: bytes, allow_cell_array: bool = False, **binary_kwargs) -> Tuple[str, pd.DataFrame]:
     if _looks_text(raw):
         text = _decode(raw)
-        if 'STREAM LISTING' in text[:100000].upper():
+        if re.search(r'(?:STREAM\s+LISTING|STREAMFLOW\s+OUT)\s+PERIOD\s+\d+\s+STEP\s+\d+', text[:100000], re.I):
             df = read_sfr_reachbyreach_ascii_listing(text)
         else:
             df = read_db_ascii(text)
@@ -1531,316 +1260,6 @@ def read_sfr_output(path: str, zip_member: str = "") -> Tuple[str, str, pd.DataF
     return fmt, name, df
 
 
-
-
-# =========================
-# LOW-MEMORY ASCII SFR OUTPUT SUPPORT
-# =========================
-SFR_OUTPUT_CHUNKSIZE = 250000
-
-
-def _open_sfr_output_text(path: str, member_name: str = ""):
-    """Open a plain or zipped SFR output file as text without reading it all."""
-    if str(path).lower().endswith(".zip"):
-        zf = zipfile.ZipFile(path, "r")
-        members = zf.namelist()
-        if member_name and member_name in members:
-            name = member_name
-        else:
-            name = members[0]
-        raw = zf.open(name, "r")
-        return name, TextIOWrapper(raw, encoding="utf-8", errors="ignore"), zf
-    return os.path.basename(path), open(path, "r", encoding="utf-8", errors="ignore"), None
-
-
-def _peek_text_prefix(path: str, member_name: str = "", n: int = 100000) -> Tuple[str, str, bool]:
-    """Return source name, text prefix, and whether the source appears text-like."""
-    if str(path).lower().endswith(".zip"):
-        with zipfile.ZipFile(path, "r") as zf:
-            members = zf.namelist()
-            name = member_name if member_name and member_name in members else members[0]
-            raw = zf.open(name, "r").read(n)
-    else:
-        name = os.path.basename(path)
-        with open(path, "rb") as f:
-            raw = f.read(n)
-    if not _looks_text(raw):
-        return name, "", False
-    return name, _decode(raw), True
-
-
-def _compact_reach_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse reach rows to one row per PER/STP/SEG for downstream ZoneBudget logic.
-
-    This preserves the first-reach FLOW_IN, last-reach FLOW_OUT, and reach-summed
-    terms. RUNOFF is stored as positive runoff only, while FARM_DIV_OUT_REACH keeps
-    the magnitude of negative RUNOFF so the existing diversion logic does not lose
-    FMP semi-routed diversions.
-    """
-    if df.empty:
-        return df
-    df = df.copy()
-    for c in ["PER", "STP", "SEG", "RCH"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    for c in ["FLOW_IN", "FLOW_OUT", "FLOW_SEEPAGE", "RUNOFF", "PRECIP", "STREAM_ET", "DELT", "SIMTIME"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "DATE_TIME" not in df.columns:
-        if "DATE_START" in df.columns:
-            df["DATE_TIME"] = pd.to_datetime(df["DATE_START"].astype(str).str.replace("T", " ", regex=False), errors="coerce")
-        else:
-            df["DATE_TIME"] = pd.NaT
-    if "DELT" not in df.columns:
-        df["DELT"] = np.nan
-    if "SIMTIME" not in df.columns:
-        df["SIMTIME"] = np.nan
-    df["RUNOFF_POS"] = df["RUNOFF"].where(df["RUNOFF"] > 0, 0.0)
-    df["FARM_DIV_OUT_REACH"] = np.where(df["RUNOFF"] < 0, -df["RUNOFF"], 0.0)
-    grp = ["PER", "STP", "SEG"]
-    ordered = df.sort_values(grp + ["RCH"])
-    first = ordered.groupby(grp, as_index=False).first()[grp + ["RCH", "FLOW_IN", "DATE_TIME", "DELT", "SIMTIME"]].rename(columns={"RCH": "RCH_FIRST"})
-    last = ordered.groupby(grp, as_index=False).last()[grp + ["RCH", "FLOW_OUT"]].rename(columns={"RCH": "RCH_LAST"})
-    sums = df.groupby(grp, as_index=False).agg(
-        FLOW_SEEPAGE=("FLOW_SEEPAGE", "sum"),
-        RUNOFF=("RUNOFF_POS", "sum"),
-        RUNOFF_POS=("RUNOFF_POS", "sum"),
-        FARM_DIV_OUT_REACH=("FARM_DIV_OUT_REACH", "sum"),
-        PRECIP=("PRECIP", "sum"),
-        STREAM_ET=("STREAM_ET", "sum"),
-    )
-    out = first.merge(last, on=grp, how="outer").merge(sums, on=grp, how="outer")
-    out["RCH"] = 1
-    out["DATE_START"] = ""
-    for c in ["LAYER", "ROW", "COL", "HEAD_STREAM", "HEAD_AQUIFER", "DEPTH_STREAM", "WIDTH_STREAM", "LENGTH_STREAM", "HEAD_GRADIENT", "COND_STREAM", "ELEV_UP_STREAM"]:
-        if c not in out.columns:
-            out[c] = np.nan
-    return out
-
-
-def _combine_compact_parts(parts: List[pd.DataFrame], source_format: str) -> pd.DataFrame:
-    if not parts:
-        raise ValueError("No SFR output rows were found while streaming the ASCII file.")
-    df = pd.concat(parts, ignore_index=True)
-    grp = ["PER", "STP", "SEG"]
-    ordered_first = df.sort_values(grp + ["RCH_FIRST"]) if "RCH_FIRST" in df.columns else df.sort_values(grp + ["RCH"])
-    ordered_last = df.sort_values(grp + ["RCH_LAST"]) if "RCH_LAST" in df.columns else df.sort_values(grp + ["RCH"])
-    first = ordered_first.groupby(grp, as_index=False).first()[grp + ["FLOW_IN", "DATE_TIME", "DELT", "SIMTIME"]]
-    last = ordered_last.groupby(grp, as_index=False).last()[grp + ["FLOW_OUT"]]
-    sums = df.groupby(grp, as_index=False).agg(
-        FLOW_SEEPAGE=("FLOW_SEEPAGE", "sum"),
-        RUNOFF=("RUNOFF_POS", "sum"),
-        RUNOFF_POS=("RUNOFF_POS", "sum"),
-        FARM_DIV_OUT_REACH=("FARM_DIV_OUT_REACH", "sum"),
-        PRECIP=("PRECIP", "sum"),
-        STREAM_ET=("STREAM_ET", "sum"),
-    )
-    out = first.merge(last, on=grp, how="outer").merge(sums, on=grp, how="outer")
-    out["RCH"] = 1
-    out["DATE_START"] = ""
-    for c in ["LAYER", "ROW", "COL", "HEAD_STREAM", "HEAD_AQUIFER", "DEPTH_STREAM", "WIDTH_STREAM", "LENGTH_STREAM", "HEAD_GRADIENT", "COND_STREAM", "ELEV_UP_STREAM"]:
-        if c not in out.columns:
-            out[c] = np.nan
-    out.attrs["source_format"] = source_format + "_stream_compact"
-    out.attrs["zonebudget_ready"] = True
-    return out
-
-
-def _iter_sfr_listing_reach_chunks(fh, chunksize: int = SFR_OUTPUT_CHUNKSIZE) -> Iterator[pd.DataFrame]:
-    rows: List[Dict[str, Any]] = []
-    per: Optional[int] = None
-    stp: Optional[int] = None
-    for line in fh:
-        m = _HEADER_RE.search(line)
-        if m:
-            per, stp = int(m.group(1)), int(m.group(2))
-            continue
-        if per is None:
-            continue
-        toks = line.strip().replace('D','E').replace('d','E').split()
-        if len(toks) not in (16, 17):
-            continue
-        if not all(_NUM_RE.match(t) for t in toks):
-            continue
-        try:
-            ints = [int(float(toks[i])) for i in range(5)]
-            vals = [float(x) for x in toks[5:]]
-        except Exception:
-            continue
-        cols = LISTING_COLS_11 if len(toks) == 16 else LISTING_COLS_12
-        rec = dict(zip(cols[:5], ints))
-        rec.update(dict(zip(cols[5:], vals)))
-        rec.update(PER=per, STP=stp, DELT=np.nan, SIMTIME=np.nan, DATE_START='', DATE_TIME=pd.NaT)
-        rows.append(rec)
-        if len(rows) >= chunksize:
-            yield _normalize(pd.DataFrame(rows), source_format='ascii_rbr_listing')
-            rows = []
-    if rows:
-        yield _normalize(pd.DataFrame(rows), source_format='ascii_rbr_listing')
-
-
-def read_sfr_output_ascii_stream_compact(
-    path: str,
-    zip_member: str = "",
-    zone_mode: str = "segment",
-    zones: Optional[pd.DataFrame] = None,
-) -> Tuple[str, str, pd.DataFrame]:
-    """Read large ASCII SFR output in chunks and return a compact segment table.
-
-    In by-reach mode, reach-level budget terms and every consecutive-reach zone
-    crossing are aggregated while streaming. Only segment endpoint records and
-    aggregated zone/transfer tables are retained in memory.
-    """
-    name, prefix, is_text = _peek_text_prefix(path, zip_member)
-    if not is_text:
-        raise ValueError("SFR output does not appear to be text; use the binary reader.")
-
-    key_to_zone: Dict[Tuple[int, int], int] = {}
-    if zone_mode == "reach":
-        if zones is None:
-            raise ValueError("By-reach streaming requires the parsed zone table.")
-        key_to_zone = {
-            (int(r.segment), int(r.reach)): int(r.zone)
-            for r in zones.itertuples(index=False)
-        }
-
-    parts: List[pd.DataFrame] = []
-    zone_term_parts: List[pd.DataFrame] = []
-    farm_div_parts: List[pd.DataFrame] = []
-    reach_transfer_parts: List[pd.DataFrame] = []
-    endpoint_parts: List[pd.DataFrame] = []
-    carry: Optional[pd.DataFrame] = None
-    reported_timesteps: Set[Tuple[int, int]] = set()
-
-    def consume(chunk: pd.DataFrame) -> None:
-        nonlocal carry
-        for per, stp in chunk[["PER", "STP"]].drop_duplicates().itertuples(index=False, name=None):
-            key = (int(per), int(stp))
-            if key not in reported_timesteps:
-                _budget_timestep_status(*key)
-                reported_timesteps.add(key)
-        if zone_mode != "reach":
-            parts.append(_compact_reach_rows(chunk))
-            return
-
-        c = chunk.copy()
-        c["ZONE"] = [
-            key_to_zone.get((int(seg), int(rch)), 0)
-            for seg, rch in zip(c["SEG"], c["RCH"])
-        ]
-        c["RUNOFF_POS"] = pd.to_numeric(c["RUNOFF"], errors="coerce").fillna(0.0).clip(lower=0.0)
-        c["FARM_DIV_OUT_REACH"] = np.where(
-            pd.to_numeric(c["RUNOFF"], errors="coerce").fillna(0.0) < 0,
-            -pd.to_numeric(c["RUNOFF"], errors="coerce").fillna(0.0),
-            0.0,
-        )
-        zone_term_parts.append(c.groupby(["PER", "STP", "ZONE"], as_index=False).agg(
-            FLOW_SEEPAGE=("FLOW_SEEPAGE", "sum"),
-            RUNOFF=("RUNOFF_POS", "sum"),
-            PRECIP=("PRECIP", "sum"),
-            STREAM_ET=("STREAM_ET", "sum"),
-        ))
-        farm_div_parts.append(c.groupby(["PER", "STP", "ZONE"], as_index=False)["FARM_DIV_OUT_REACH"].sum())
-
-        # Endpoint information is used for all connections that occur only at
-        # segment starts/ends: normal routing, SFR diversions, and lakes.
-        ordered = c.sort_values(["PER", "STP", "SEG", "RCH"])
-        first = ordered.groupby(["PER", "STP", "SEG"], as_index=False).first()[
-            ["PER", "STP", "SEG", "RCH", "ZONE", "FLOW_IN", "DATE_TIME", "DELT", "SIMTIME"]
-        ].rename(columns={"RCH": "RCH_FIRST", "ZONE": "FIRST_ZONE"})
-        last = ordered.groupby(["PER", "STP", "SEG"], as_index=False).last()[
-            ["PER", "STP", "SEG", "RCH", "ZONE", "FLOW_OUT"]
-        ].rename(columns={"RCH": "RCH_LAST", "ZONE": "LAST_ZONE"})
-        endpoint_parts.append(first.merge(last, on=["PER", "STP", "SEG"], how="outer"))
-
-        # Include the final row from the previous chunk so a zone crossing split
-        # across a chunk boundary is not missed.
-        x = pd.concat([carry, ordered], ignore_index=True) if carry is not None else ordered
-        x = x.sort_values(["PER", "STP", "SEG", "RCH"])
-        same = (
-            x["PER"].eq(x["PER"].shift())
-            & x["STP"].eq(x["STP"].shift())
-            & x["SEG"].eq(x["SEG"].shift())
-            & x["RCH"].eq(x["RCH"].shift() + 1)
-        )
-        changed = same & x["ZONE"].ne(x["ZONE"].shift())
-        if changed.any():
-            tr = pd.DataFrame({
-                "PER": x.loc[changed, "PER"].astype(int).to_numpy(),
-                "STP": x.loc[changed, "STP"].astype(int).to_numpy(),
-                "FROM_ZONE": x.loc[changed, "ZONE"].shift(1).to_numpy(),
-                "TO_ZONE": x.loc[changed, "ZONE"].astype(int).to_numpy(),
-                "Q": x.loc[changed, "FLOW_OUT"].shift(1).astype(float).to_numpy(),
-            })
-            # shift() above is indexed against x; rebuild directly from predecessor indices.
-            idx = x.index[changed]
-            prev_idx = idx - 1
-            tr["FROM_ZONE"] = x.loc[prev_idx, "ZONE"].astype(int).to_numpy()
-            tr["Q"] = x.loc[prev_idx, "FLOW_OUT"].astype(float).clip(lower=0.0).to_numpy()
-            tr["TYPE"] = "WITHIN_SEGMENT"
-            reach_transfer_parts.append(tr)
-
-        carry = ordered.groupby(["PER", "STP", "SEG"], as_index=False).last()
-        parts.append(_compact_reach_rows(c))
-
-    if "STREAM LISTING" in prefix.upper():
-        name, fh, zf = _open_sfr_output_text(path, zip_member)
-        try:
-            for chunk in _iter_sfr_listing_reach_chunks(fh):
-                consume(chunk)
-        finally:
-            fh.close()
-            if zf is not None:
-                zf.close()
-        fmt = "ascii_rbr_listing"
-    else:
-        if str(path).lower().endswith(".zip"):
-            name, fh, zf = _open_sfr_output_text(path, zip_member)
-            try:
-                reader = pd.read_csv(fh, sep=r'\s+|,', engine='python', chunksize=int(SFR_OUTPUT_CHUNKSIZE))
-                for chunk in reader:
-                    consume(_normalize(chunk, source_format='ascii_db'))
-            finally:
-                fh.close()
-                if zf is not None:
-                    zf.close()
-        else:
-            reader = pd.read_csv(path, sep=r'\s+|,', engine='python', chunksize=int(SFR_OUTPUT_CHUNKSIZE))
-            for chunk in reader:
-                consume(_normalize(chunk, source_format='ascii_db'))
-        fmt = "ascii_db"
-
-    if reported_timesteps:
-        _status_echo("SFR output processing complete.", finish=True)
-
-    out = _combine_compact_parts(parts, fmt)
-    if zone_mode == "reach":
-        def combine_sum(items: List[pd.DataFrame], keys: List[str], cols: List[str]) -> pd.DataFrame:
-            if not items:
-                return pd.DataFrame(columns=keys + cols)
-            return pd.concat(items, ignore_index=True).groupby(keys, as_index=False)[cols].sum()
-
-        out.attrs["zone_mode"] = "reach"
-        out.attrs["precomputed_zone_reach_terms"] = combine_sum(
-            zone_term_parts, ["PER", "STP", "ZONE"],
-            ["FLOW_SEEPAGE", "RUNOFF", "PRECIP", "STREAM_ET"]
-        )
-        farm = combine_sum(farm_div_parts, ["PER", "STP", "ZONE"], ["FARM_DIV_OUT_REACH"])
-        out.attrs["precomputed_farm_div_zone"] = farm.rename(columns={"FARM_DIV_OUT_REACH": "FARM_DIVERSION_NET_QC"})
-        out.attrs["within_reach_transfers"] = (
-            pd.concat(reach_transfer_parts, ignore_index=True)
-            if reach_transfer_parts else
-            pd.DataFrame(columns=["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"])
-        )
-        endpoints = pd.concat(endpoint_parts, ignore_index=True)
-        ep_first = endpoints.sort_values(["PER", "STP", "SEG", "RCH_FIRST"]).groupby(["PER", "STP", "SEG"], as_index=False).first()
-        ep_last = endpoints.sort_values(["PER", "STP", "SEG", "RCH_LAST"]).groupby(["PER", "STP", "SEG"], as_index=False).last()
-        ep = ep_first[["PER", "STP", "SEG", "RCH_FIRST", "FIRST_ZONE", "FLOW_IN", "DATE_TIME", "DELT", "SIMTIME"]].merge(
-            ep_last[["PER", "STP", "SEG", "RCH_LAST", "LAST_ZONE", "FLOW_OUT"]],
-            on=["PER", "STP", "SEG"], how="outer"
-        )
-        out.attrs["segment_endpoints"] = ep
-    return fmt + "_stream_compact", name, out
-
 def build_zonebudget_excel(
     df: pd.DataFrame,
     routing: pd.DataFrame,
@@ -1850,13 +1269,6 @@ def build_zonebudget_excel(
     meta: Dict,
     lake_budget: Optional[pd.DataFrame] = None,
 ) -> None:
-    # Streaming by-reach inputs carry aggregated reach-zone terms, endpoint zones,
-    # and within-segment transfers in dataframe attributes.
-    pre_zone_terms = df.attrs.get("precomputed_zone_reach_terms")
-    pre_farm_div_zone = df.attrs.get("precomputed_farm_div_zone")
-    within_reach_transfers = df.attrs.get("within_reach_transfers")
-    segment_endpoints = df.attrs.get("segment_endpoints")
-
     # Build zone mapping
     if zone_mode == "segment":
         seg_to_zone = dict(zip(zones["segment"], zones["zone"]))
@@ -1865,40 +1277,9 @@ def build_zonebudget_excel(
         reach_zone = None
     else:
         key_to_zone = {(int(r.segment), int(r.reach)): int(r.zone) for r in zones.itertuples(index=False)}
-        if segment_endpoints is None:
-            # Non-streamed inputs still contain complete reach rows.
-            df["ZONE"] = [key_to_zone.get((int(s), int(r)), 0) for s, r in zip(df["SEG"].values, df["RCH"].values)]
-        else:
-            # Compact rows are segment summaries; their endpoint zones are applied
-            # later rather than pretending the whole segment has one zone.
-            df["ZONE"] = 0
+        df["ZONE"] = [key_to_zone.get((int(s), int(r)), 0) for s, r in zip(df["SEG"].values, df["RCH"].values)]
         seg_zone = None
         reach_zone = lambda s, r: key_to_zone.get((int(s), int(r)), 0)
-
-        # For non-streamed/full reach tables (including binary inputs), derive
-        # every within-segment reach-zone crossing here.
-        if segment_endpoints is None:
-            ordered_reaches = df.sort_values(["PER", "STP", "SEG", "RCH"]).reset_index(drop=True)
-            same_route = (
-                ordered_reaches["PER"].eq(ordered_reaches["PER"].shift())
-                & ordered_reaches["STP"].eq(ordered_reaches["STP"].shift())
-                & ordered_reaches["SEG"].eq(ordered_reaches["SEG"].shift())
-                & ordered_reaches["RCH"].eq(ordered_reaches["RCH"].shift() + 1)
-            )
-            zone_change = same_route & ordered_reaches["ZONE"].ne(ordered_reaches["ZONE"].shift())
-            idx = ordered_reaches.index[zone_change]
-            if len(idx):
-                prev = idx - 1
-                within_reach_transfers = pd.DataFrame({
-                    "PER": ordered_reaches.loc[idx, "PER"].astype(int).to_numpy(),
-                    "STP": ordered_reaches.loc[idx, "STP"].astype(int).to_numpy(),
-                    "FROM_ZONE": ordered_reaches.loc[prev, "ZONE"].astype(int).to_numpy(),
-                    "TO_ZONE": ordered_reaches.loc[idx, "ZONE"].astype(int).to_numpy(),
-                    "Q": ordered_reaches.loc[prev, "FLOW_OUT"].astype(float).clip(lower=0.0).to_numpy(),
-                    "TYPE": "WITHIN_SEGMENT",
-                })
-            else:
-                within_reach_transfers = pd.DataFrame(columns=["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"])
 
     # Lake zone mapping. Lakes can be assigned in by-segment zone files using
     # negative Segment values (e.g., Segment=-3 means Lake 3). By-reach zone files
@@ -1914,11 +1295,7 @@ def build_zonebudget_excel(
 
     # Zones list (include 0, SFR zones, and any lake-only zones)
     lake_zones = set(lake_budget["ZONE"].unique().tolist()) if lake_budget is not None else set()
-    if zone_mode == "reach":
-        sfr_zones = set(int(z) for z in zones["zone"].unique().tolist())
-    else:
-        sfr_zones = set(df["ZONE"].unique().tolist())
-    zones_list = sorted(sfr_zones | lake_zones | {0})
+    zones_list = sorted(set(df["ZONE"].unique().tolist()) | lake_zones | {0})
 
     # Timestep keys
     tkeys = df[["DATE_TIME", "PER", "STP", "DELT", "SIMTIME"]].drop_duplicates().sort_values(["PER", "STP"]).reset_index(drop=True)
@@ -1945,31 +1322,19 @@ def build_zonebudget_excel(
         if s > 0:
             src_to_dests.setdefault(s, []).append(d)
 
-    # Segment endpoint inflow/outflow and endpoint zones.
+    # Segment inflow/outflow per timestep (use reach ordering)
     grp = ["PER", "STP", "SEG"]
-    if zone_mode == "reach" and segment_endpoints is not None:
-        seg_flow = segment_endpoints.rename(columns={
-            "FLOW_IN": "SEG_FLOW_IN", "FLOW_OUT": "SEG_FLOW_OUT"
-        }).copy()
-        seg_flow["FIRST_ZONE"] = seg_flow["FIRST_ZONE"].fillna(0).astype(int)
-        seg_flow["LAST_ZONE"] = seg_flow["LAST_ZONE"].fillna(0).astype(int)
-        # ZONE denotes the zone at the segment start for inflow/head calculations.
-        seg_flow["ZONE"] = seg_flow["FIRST_ZONE"]
+    seg_in = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).first()[["PER", "STP", "SEG", "FLOW_IN"]].rename(columns={"FLOW_IN": "SEG_FLOW_IN"})
+    seg_out = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).last()[["PER", "STP", "SEG", "FLOW_OUT"]].rename(columns={"FLOW_OUT": "SEG_FLOW_OUT"})
+    seg_flow = seg_in.merge(seg_out, on=grp, how="outer").fillna(0.0)
+
+    # Segment zones
+    if zone_mode == "segment":
+        seg_flow["ZONE"] = seg_flow["SEG"].map(seg_to_zone).fillna(0).astype(int)
     else:
-        seg_in = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).first()[["PER", "STP", "SEG", "FLOW_IN"]].rename(columns={"FLOW_IN": "SEG_FLOW_IN"})
-        seg_out = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).last()[["PER", "STP", "SEG", "FLOW_OUT"]].rename(columns={"FLOW_OUT": "SEG_FLOW_OUT"})
-        seg_flow = seg_in.merge(seg_out, on=grp, how="outer").fillna(0.0)
-        if zone_mode == "segment":
-            seg_flow["ZONE"] = seg_flow["SEG"].map(seg_to_zone).fillna(0).astype(int)
-            seg_flow["FIRST_ZONE"] = seg_flow["ZONE"]
-            seg_flow["LAST_ZONE"] = seg_flow["ZONE"]
-        else:
-            first_zone = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).first()[grp + ["ZONE"]].rename(columns={"ZONE": "FIRST_ZONE"})
-            last_zone = df.sort_values(grp + ["RCH"]).groupby(grp, as_index=False).last()[grp + ["ZONE"]].rename(columns={"ZONE": "LAST_ZONE"})
-            seg_flow = seg_flow.merge(first_zone, on=grp, how="left").merge(last_zone, on=grp, how="left")
-            seg_flow["FIRST_ZONE"] = seg_flow["FIRST_ZONE"].fillna(0).astype(int)
-            seg_flow["LAST_ZONE"] = seg_flow["LAST_ZONE"].fillna(0).astype(int)
-            seg_flow["ZONE"] = seg_flow["FIRST_ZONE"]
+        # approximate segment zone as the most common reach zone in that segment (timestep-invariant)
+        seg_zone_mode = df.groupby("SEG")["ZONE"].agg(lambda s: int(s.value_counts().idxmax())).to_dict()
+        seg_flow["ZONE"] = seg_flow["SEG"].map(seg_zone_mode).fillna(0).astype(int)
 
     # Add routing columns
     seg_flow["OUTSEG"] = seg_flow["SEG"].map(seg_outseg).fillna(0).astype(int)
@@ -2002,10 +1367,7 @@ def build_zonebudget_excel(
     #   - Additional cross-zone diversion transfers from (B) as residual when not already represented by (A).
 
     # --- (B) Farm net diversion indicator at SOURCE segment ---
-    if "FARM_DIV_OUT_REACH" in df.columns:
-        df["DIV_FARM_NET_SRC_REACH"] = pd.to_numeric(df["FARM_DIV_OUT_REACH"], errors="coerce").fillna(0.0)
-    else:
-        df["DIV_FARM_NET_SRC_REACH"] = np.where(df["RUNOFF"] < 0, -df["RUNOFF"], 0.0)
+    df["DIV_FARM_NET_SRC_REACH"] = np.where(df["RUNOFF"] < 0, -df["RUNOFF"], 0.0)
     div_farm_src_seg = df.groupby(["PER", "STP", "SEG"], as_index=False)["DIV_FARM_NET_SRC_REACH"].sum().rename(
         columns={"DIV_FARM_NET_SRC_REACH": "DIV_FARM_NET_SRC_SEG"}
     )
@@ -2051,12 +1413,9 @@ def build_zonebudget_excel(
         div_tr["FROM_ZONE"] = div_tr["FROM_SEG"].map(seg_to_zone).fillna(0).astype(int)
         div_tr["TO_ZONE"] = div_tr["TO_SEG"].map(seg_to_zone).fillna(0).astype(int)
     else:
-        # SFR diversions leave the end of the source segment and enter the
-        # beginning of the destination segment.
-        last_zone_map = seg_flow.groupby("SEG")["LAST_ZONE"].first().to_dict()
-        first_zone_map = seg_flow.groupby("SEG")["FIRST_ZONE"].first().to_dict()
-        div_tr["FROM_ZONE"] = div_tr["FROM_SEG"].map(last_zone_map).fillna(0).astype(int)
-        div_tr["TO_ZONE"] = div_tr["TO_SEG"].map(first_zone_map).fillna(0).astype(int)
+        # use seg_zone_mode computed above
+        div_tr["FROM_ZONE"] = div_tr["FROM_SEG"].map(seg_zone_mode).fillna(0).astype(int)
+        div_tr["TO_ZONE"] = div_tr["TO_SEG"].map(seg_zone_mode).fillna(0).astype(int)
 
     # Split into internal diversion QC vs interzone diversion transfer
     internal_div = div_tr[div_tr["FROM_ZONE"] == div_tr["TO_ZONE"]].groupby(["PER", "STP", "FROM_ZONE"], as_index=False)["Q"].sum()
@@ -2068,19 +1427,17 @@ def build_zonebudget_excel(
     if zone_mode == "segment":
         out_zone = seg_flow["OUTSEG"].map(seg_to_zone).fillna(0).astype(int)
     else:
-        first_zone_map = seg_flow.groupby("SEG")["FIRST_ZONE"].first().to_dict()
-        out_zone = seg_flow["OUTSEG"].map(first_zone_map).fillna(0).astype(int)
+        out_zone = seg_flow["OUTSEG"].map(seg_zone_mode).fillna(0).astype(int)
     seg_flow["OUT_ZONE"] = out_zone
-    seg_flow["ROUTING_FROM_ZONE"] = seg_flow["LAST_ZONE"] if zone_mode == "reach" else seg_flow["ZONE"]
 
-    down_tr = seg_flow[(seg_flow["OUTSEG"] > 0) & (seg_flow["ROUTING_FROM_ZONE"] != seg_flow["OUT_ZONE"])][
-        ["PER", "STP", "SEG", "OUTSEG", "SEG_FLOW_OUT", "DIV_SFR_FROM_SOURCE", "ROUTING_FROM_ZONE", "OUT_ZONE"]
+    down_tr = seg_flow[(seg_flow["OUTSEG"] > 0) & (seg_flow["ZONE"] != seg_flow["OUT_ZONE"])][
+        ["PER", "STP", "SEG", "OUTSEG", "SEG_FLOW_OUT", "DIV_SFR_FROM_SOURCE", "ZONE", "OUT_ZONE"]
     ].copy()
     # IMPORTANT: SEG_FLOW_OUT at diversion sources can include water diverted to SFR diversion segments.
     # To avoid double-counting, subtract SFR-defined diversions taken from the source when computing
     # downstream interzone transfers.
     down_tr["Q"] = (down_tr["SEG_FLOW_OUT"] - down_tr["DIV_SFR_FROM_SOURCE"].fillna(0.0)).clip(lower=0.0)
-    down_tr = down_tr.rename(columns={"SEG": "FROM_SEG", "OUTSEG": "TO_SEG", "ROUTING_FROM_ZONE": "FROM_ZONE", "OUT_ZONE": "TO_ZONE"})
+    down_tr = down_tr.rename(columns={"SEG": "FROM_SEG", "OUTSEG": "TO_SEG", "ZONE": "FROM_ZONE", "OUT_ZONE": "TO_ZONE"})
     down_tr["TYPE"] = "DOWNSTREAM"
 
     div_xzone["TYPE"] = "DIVERSION_NET"
@@ -2092,10 +1449,10 @@ def build_zonebudget_excel(
     # segment inflow after routed upstream inflow and SFR-defined diversion inflow.
     lake_tr_parts = []
 
-    sfr_to_lake = seg_flow[seg_flow["OUTSEG"] < 0][["PER", "STP", "SEG", "OUTSEG", "SEG_FLOW_OUT", "ZONE", "LAST_ZONE"]].copy()
+    sfr_to_lake = seg_flow[seg_flow["OUTSEG"] < 0][["PER", "STP", "SEG", "OUTSEG", "SEG_FLOW_OUT", "ZONE"]].copy()
     if not sfr_to_lake.empty:
         sfr_to_lake["LAKE"] = sfr_to_lake["OUTSEG"].abs().astype(int)
-        sfr_to_lake["FROM_ZONE"] = sfr_to_lake["LAST_ZONE"].astype(int) if "LAST_ZONE" in sfr_to_lake.columns else sfr_to_lake["ZONE"].astype(int)
+        sfr_to_lake["FROM_ZONE"] = sfr_to_lake["ZONE"].astype(int)
         sfr_to_lake["TO_ZONE"] = sfr_to_lake["LAKE"].map(lake_to_zone).fillna(0).astype(int)
         sfr_to_lake["Q"] = sfr_to_lake["SEG_FLOW_OUT"].clip(lower=0.0)
         sfr_to_lake["TYPE"] = "SFR_TO_LAKE"
@@ -2110,12 +1467,12 @@ def build_zonebudget_excel(
     ).clip(lower=0.0)
 
     lake_to_sfr = seg_flow[is_lake_inflow_seg & (seg_flow["LAKE_TO_SFR_IN_SEG"] > 0)][
-        ["PER", "STP", "SEG", "IUPSEG", "LAKE_TO_SFR_IN_SEG", "ZONE", "FIRST_ZONE"]
+        ["PER", "STP", "SEG", "IUPSEG", "LAKE_TO_SFR_IN_SEG", "ZONE"]
     ].copy()
     if not lake_to_sfr.empty:
         lake_to_sfr["LAKE"] = lake_to_sfr["IUPSEG"].abs().astype(int)
         lake_to_sfr["FROM_ZONE"] = lake_to_sfr["LAKE"].map(lake_to_zone).fillna(0).astype(int)
-        lake_to_sfr["TO_ZONE"] = lake_to_sfr["FIRST_ZONE"].astype(int) if "FIRST_ZONE" in lake_to_sfr.columns else lake_to_sfr["ZONE"].astype(int)
+        lake_to_sfr["TO_ZONE"] = lake_to_sfr["ZONE"].astype(int)
         lake_to_sfr["Q"] = lake_to_sfr["LAKE_TO_SFR_IN_SEG"].clip(lower=0.0)
         lake_to_sfr["TYPE"] = "LAKE_TO_SFR"
         lake_tr_parts.append(lake_to_sfr[["PER", "STP", "FROM_ZONE", "TO_ZONE", "Q", "TYPE"]])
@@ -2130,16 +1487,10 @@ def build_zonebudget_excel(
     lake_xzone = lake_tr[lake_tr["FROM_ZONE"] != lake_tr["TO_ZONE"]].copy()
 
     # Combine transfers (for IN/OUT columns)
-    within_xzone = (
-        within_reach_transfers.copy()
-        if isinstance(within_reach_transfers, pd.DataFrame)
-        else pd.DataFrame(columns=["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"])
-    )
     all_tr = pd.concat([
         down_tr[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
         div_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
         lake_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
-        within_xzone[["PER","STP","FROM_ZONE","TO_ZONE","Q","TYPE"]],
     ], ignore_index=True)
     tr_sum = all_tr.groupby(["PER","STP","FROM_ZONE","TO_ZONE"], as_index=False)["Q"].sum()
 
@@ -2166,40 +1517,21 @@ def build_zonebudget_excel(
     seg_flow["ADDITIONAL_INFLOW"] = np.where(~seg_flow["IS_HEAD_SEGMENT"], seg_flow["PRESCRIBED_INFLOW_RESIDUAL"], 0.0)
 
     # Reach-level terms by zone
-    if "RUNOFF_POS" not in df.columns:
-        df["RUNOFF_POS"] = df["RUNOFF"].where(df["RUNOFF"] > 0, 0.0)
-    else:
-        df["RUNOFF_POS"] = pd.to_numeric(df["RUNOFF_POS"], errors="coerce").fillna(0.0)
-    if "FARM_DIV_OUT_REACH" not in df.columns:
-        df["FARM_DIV_OUT_REACH"] = np.where(df["RUNOFF"] < 0, -df["RUNOFF"], 0.0)
-    else:
-        df["FARM_DIV_OUT_REACH"] = pd.to_numeric(df["FARM_DIV_OUT_REACH"], errors="coerce").fillna(0.0)
-    if isinstance(pre_zone_terms, pd.DataFrame):
-        zone_reach_terms = pre_zone_terms.copy()
-    else:
-        zone_reach_terms = df.groupby(["PER","STP","ZONE"], as_index=False).agg(
-            FLOW_SEEPAGE=("FLOW_SEEPAGE","sum"),
-            RUNOFF=("RUNOFF_POS","sum"),
-            PRECIP=("PRECIP","sum"),
-            STREAM_ET=("STREAM_ET","sum"),
-        )
-    # Reverse the native SFR sign so output is from the stream perspective:
-    # positive FLOW_SEEPAGE is gain from groundwater; negative is stream loss.
-    zone_reach_terms["FLOW_SEEPAGE"] = -pd.to_numeric(
-        zone_reach_terms["FLOW_SEEPAGE"], errors="coerce"
-    ).fillna(0.0)
-
-    if isinstance(pre_farm_div_zone, pd.DataFrame):
-        farm_div_zone = pre_farm_div_zone.copy()
-    else:
-        farm_div_zone = df.groupby(["PER","STP","ZONE"], as_index=False)["FARM_DIV_OUT_REACH"].sum().rename(columns={"FARM_DIV_OUT_REACH":"FARM_DIVERSION_NET_QC"})
+    df["RUNOFF_POS"] = df["RUNOFF"].where(df["RUNOFF"] > 0, 0.0)
+    df["FARM_DIV_OUT_REACH"] = np.where(df["RUNOFF"] < 0, -df["RUNOFF"], 0.0)
+    zone_reach_terms = df.groupby(["PER","STP","ZONE"], as_index=False).agg(
+        FLOW_SEEPAGE=("FLOW_SEEPAGE","sum"),
+        RUNOFF=("RUNOFF_POS","sum"),
+        PRECIP=("PRECIP","sum"),
+        STREAM_ET=("STREAM_ET","sum"),
+    )
+    farm_div_zone = df.groupby(["PER","STP","ZONE"], as_index=False)["FARM_DIV_OUT_REACH"].sum().rename(columns={"FARM_DIV_OUT_REACH":"FARM_DIVERSION_NET_QC"})
 
 
     zone_head = seg_flow.groupby(["PER","STP","ZONE"], as_index=False)["HEAD_EXT"].sum().rename(columns={"HEAD_EXT":"FLOW_HEAD"})
     zone_additional = seg_flow.groupby(["PER","STP","ZONE"], as_index=False)["ADDITIONAL_INFLOW"].sum()
 
-    outmodel_zone_col = "LAST_ZONE" if zone_mode == "reach" else "ZONE"
-    zone_outmodel = seg_flow[seg_flow["IS_OUTMODEL"]].groupby(["PER","STP",outmodel_zone_col], as_index=False)["SEG_FLOW_OUT"].sum().rename(columns={outmodel_zone_col:"ZONE", "SEG_FLOW_OUT":"FLOW_OUTOFMODEL"})
+    zone_outmodel = seg_flow[seg_flow["IS_OUTMODEL"]].groupby(["PER","STP","ZONE"], as_index=False)["SEG_FLOW_OUT"].sum().rename(columns={"SEG_FLOW_OUT":"FLOW_OUTOFMODEL"})
 
     lake_cols = [
         "LAK_PRECIP", "LAK_EVAP", "LAK_RUNOFF", "LAK_GW_INFLOW", "LAK_GW_OUTFLOW",
@@ -2260,11 +1592,10 @@ def build_zonebudget_excel(
         out_cols = [f"OUT_TO_ZONE_{k}" for k in zones_list]
         ts["MASS_BALANCE_RESIDUAL"] = (
             ts["FLOW_HEAD"] + ts["ADDITIONAL_INFLOW"] + ts["RUNOFF"] + ts["PRECIP"]
-            + ts["FLOW_SEEPAGE"]
             + ts["LAK_PRECIP"] + ts["LAK_RUNOFF"] + ts["LAK_GW_INFLOW"]
             + ts[in_cols].sum(axis=1)
             - (
-                ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"]
+                ts["FLOW_SEEPAGE"] + ts["STREAM_ET"] + ts["FLOW_OUTOFMODEL"] + ts["FARM_DIVERSION_NET_QC"]
                 + ts["LAK_EVAP"] + ts["LAK_GW_OUTFLOW"] + ts["LAK_WATER_USE"] + ts["LAK_STORAGE_CHANGE"]
                 + ts[out_cols].sum(axis=1)
             )
@@ -2294,9 +1625,6 @@ def build_zonebudget_excel(
         PRECIP=("PRECIP","sum"),
         STREAM_ET=("STREAM_ET","sum"),
     )
-    sys_reach["FLOW_SEEPAGE"] = -pd.to_numeric(
-        sys_reach["FLOW_SEEPAGE"], errors="coerce"
-    ).fillna(0.0)
     sys_ts = sys_ts.merge(sys_reach, on=["PER","STP"], how="left")
 
     # Sum headwater external inflow across all segments
@@ -2332,10 +1660,9 @@ def build_zonebudget_excel(
     # System mass balance residual (no interzone terms; they cancel at system scale)
     sys_ts["MASS_BALANCE_RESIDUAL_SYSTEM"] = (
         sys_ts["FLOW_HEAD"] + sys_ts["ADDITIONAL_INFLOW"] + sys_ts["RUNOFF"] + sys_ts["PRECIP"]
-        + sys_ts["FLOW_SEEPAGE"]
         + sys_ts["LAK_PRECIP"] + sys_ts["LAK_RUNOFF"] + sys_ts["LAK_GW_INFLOW"]
         - (
-            sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"]
+            sys_ts["FLOW_SEEPAGE"] + sys_ts["STREAM_ET"] + sys_ts["FLOW_OUTOFMODEL"] + sys_ts["FARM_DIVERSION_NET_TOTAL_QC"]
             + sys_ts["LAK_EVAP"] + sys_ts["LAK_GW_OUTFLOW"] + sys_ts["LAK_WATER_USE"] + sys_ts["LAK_STORAGE_CHANGE"]
         )
     )
@@ -2448,10 +1775,7 @@ def build_zonebudget_excel(
         ("Default zone for unspecified", 0),
         ("Routing CSV (QC)", meta.get("routing_csv","")),
         ("Routing edge CSV (QC)", meta.get("routing_edges_csv","")),
-        ("Routing diagram DOT", meta.get("routing_dot","")),
-        ("Routing diagram PNG", meta.get("routing_png","")),
-        ("Routing diagram legend shown", meta.get("routing_show_legend","")),
-        ("Routing diagram QC issues shown", meta.get("routing_show_qc_issues","")),
+        ("Routing diagram", meta.get("routing_diagram","")),
         ("Lake routing QC CSV", meta.get("lake_qc_csv","")),
         ("LAK input", meta.get("lak_input","")),
         ("LAK budget CSV", meta.get("lak_budget_csv","")),
@@ -2469,7 +1793,6 @@ def build_zonebudget_excel(
         ("Diversion caveat", "RUNOFF at diversion sources may include natural runoff (+) and diversion (-); FARM_DIVERSION_NET=max(0,-RUNOFF) is a net indicator, not guaranteed gross diversion."),
         ("Additional inflow method", "For non-head segments, ADDITIONAL_INFLOW=max(0, segment FLOW_IN - routed upstream stream inflow - lake-to-stream inflow - SFR diversion inflow). This captures prescribed FLOW from SFR Data Set 6a at non-head locations, including tabfile-driven FLOW, without reading tabfiles."),
         ("Additional inflow tolerance", ADDITIONAL_INFLOW_TOLERANCE),
-        ("FLOW_SEEPAGE sign convention", "Stream perspective: positive is gain from groundwater; negative is loss from stream to groundwater."),
         ("Output basis", OUTPUT_BASIS),
         ("Model length unit", MODEL_LENGTH_UNIT),
         ("Output volume unit", OUTPUT_VOLUME_UNIT),
@@ -2543,47 +1866,29 @@ def run():
     routing = routing_res["routing_table"].copy()
 
     lak_info = parse_lak_sublake_systems(LAK_INPUT_PATH)
-    # Recompute hanging-subnetwork QC using LAK connectivity so streams connected
-    # through lakes or sublake systems are not falsely flagged as disconnected.
-    routing = update_hanging_subnetwork_flags(routing, lak_info=lak_info)
     routing_edges_csv = OUT_ROUTING_EDGES_CSV_PATH.strip()
     if not routing_edges_csv:
         base, _ = os.path.splitext(routing_csv)
         routing_edges_csv = base + "_edges.csv"
     lake_qc_csv = os.path.splitext(routing_edges_csv)[0] + "_lake_qc.csv"
+    routing_diagram = OUT_ROUTING_DIAGRAM_PATH.strip()
+    if not routing_diagram:
+        routing_diagram = os.path.splitext(routing_edges_csv)[0] + "_diagram.png"
+
+    # Read zones before writing the routing edge table/diagram so zones can be
+    # displayed automatically wherever the zone file provides them.
+    zone_mode, zones = read_zone_config(ZONE_CONFIG_PATH)
 
     routing.to_csv(routing_csv, index=False)
     routing_edges = build_routing_edges_table(routing, lak_info)
+    routing_edges = add_zone_labels_to_routing_edges(routing_edges, zone_mode, zones)
     routing_edges.to_csv(routing_edges_csv, index=False)
+    rendered_diagram = write_routing_diagram(routing_edges, zone_mode, zones, routing_diagram)
     lake_qc = build_lake_routing_qc(routing, lak_info)
     lake_qc.to_csv(lake_qc_csv, index=False)
 
-    # Read zones
-    zone_mode, zones = read_zone_config(ZONE_CONFIG_PATH)
-
-    # Write routing diagram. Zones are shown automatically because this script
-    # already requires ZONE_CONFIG_PATH. Zone 0 and unassigned nodes remain outside boxes.
-    zone_info = build_routing_zone_info(zone_mode, zones)
-    routing_dot = OUT_ROUTING_DOT_PATH.strip()
-    if not routing_dot:
-        base, _ = os.path.splitext(routing_csv)
-        routing_dot = base + "_diagram.dot"
-    write_routing_dot(routing, routing_edges, routing_dot, zone_info=zone_info, lak_info=lak_info, network_direction=NETWORK_DIRECTION, show_legend=SHOW_LEGEND, show_qc_issues=SHOW_QC_ISSUES)
-
-    routing_png = OUT_ROUTING_PNG_PATH.strip()
-    if routing_png:
-        render_routing_png_from_dot(routing_dot, routing_png)
-
-    # Read SFR output. Large ASCII files are streamed and compacted to one row per
-    # PER/STP/SEG so reach-by-reach rows are not held in memory. Binary files use
-    # the existing reader because their format requires byte-level parsing.
-    _member_probe, _prefix_probe, _is_text_probe = _peek_text_prefix(SFR_OUTPUT_PATH, ZIP_MEMBER_NAME)
-    if _is_text_probe:
-        fmt, member, df = read_sfr_output_ascii_stream_compact(
-            SFR_OUTPUT_PATH, ZIP_MEMBER_NAME, zone_mode=zone_mode, zones=zones
-        )
-    else:
-        fmt, member, df = read_sfr_output(SFR_OUTPUT_PATH, ZIP_MEMBER_NAME)
+    # Read SFR output
+    fmt, member, df = read_sfr_output(SFR_OUTPUT_PATH, ZIP_MEMBER_NAME)
 
     # Read optional LAK budget CSV produced by the companion listing-file scraper
     lake_budget = read_lake_budget_csv(LAK_BUDGET_CSV_PATH)
@@ -2602,10 +1907,7 @@ def run():
         zone_config=ZONE_CONFIG_PATH,
         routing_csv=routing_csv,
         routing_edges_csv=routing_edges_csv,
-        routing_dot=routing_dot,
-        routing_png=routing_png,
-        routing_show_legend=SHOW_LEGEND,
-        routing_show_qc_issues=SHOW_QC_ISSUES,
+        routing_diagram=rendered_diagram or routing_diagram,
         lake_qc_csv=lake_qc_csv,
         lak_input=LAK_INPUT_PATH,
         lak_budget_csv=LAK_BUDGET_CSV_PATH,
@@ -2622,11 +1924,7 @@ def run():
     print("=== SFR ZoneBudget ===")
     print(f"Wrote routing CSV:      {routing_csv}")
     print(f"Wrote routing edge CSV: {routing_edges_csv}")
-    print(f"Wrote routing diagram:  {routing_dot}")
-    if routing_png:
-        print(f"Wrote routing PNG:      {routing_png}")
-    for warning in zone_info.get("warnings", []):
-        print(f"Zone diagram warning:   {warning}")
+    print(f"Wrote routing diagram:  {rendered_diagram or routing_diagram}")
     print(f"Wrote lake QC CSV:      {lake_qc_csv}")
     if lake_budget is not None:
         print(f"Read LAK budget rows:   {len(lake_budget)}")
